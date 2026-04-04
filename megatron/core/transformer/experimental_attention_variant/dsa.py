@@ -2464,10 +2464,12 @@ class DSAIndexer(MegatronModule):
         cu_seqlens: Optional[torch.Tensor] = None,
     ):
         """Apply RoPE to the input tensor."""
-        # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
-        x_nope, x_pe = torch.split(
-            x, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
+        # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
+        # To align with DeepSeek's implementation,
+        # x_pe is placed at the front, and x_nope is placed at the back.
+        x_pe, x_nope = torch.split(
+            x, [self.qk_pos_emb_head_dim, self.index_head_dim - self.qk_pos_emb_head_dim], dim=-1
         )
         squeezed_batch_dim = False
         if cu_seqlens is not None and cu_seqlens.device != x_pe.device:
@@ -2491,7 +2493,7 @@ class DSAIndexer(MegatronModule):
         if squeezed_batch_dim:
             x_pe = x_pe.unsqueeze(1)
         # [seqlen, batch, *, index_head_dim]
-        x = torch.cat([x_nope, x_pe], dim=-1)
+        x = torch.cat([x_pe, x_nope], dim=-1)
         return x
 
     def forward_before_topk(
