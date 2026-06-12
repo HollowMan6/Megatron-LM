@@ -174,6 +174,7 @@ def run_fused_dsa_attention(
     varlen_ends: Optional[Tensor],
     key_positions: Optional[Tensor],
     use_relu: bool,
+    use_local_indexer_varlen: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
     backend = _load_backend(config)
@@ -204,6 +205,7 @@ def run_fused_dsa_attention(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
         use_relu=use_relu,
+        use_local_indexer_varlen=use_local_indexer_varlen,
     )
 
 
