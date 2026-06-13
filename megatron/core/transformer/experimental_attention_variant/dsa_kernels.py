@@ -173,6 +173,7 @@ def run_fused_dsa_attention(
     varlen_starts: Optional[Tensor],
     varlen_ends: Optional[Tensor],
     key_positions: Optional[Tensor],
+    query_valid_rows: Optional[Tensor],
     use_relu: bool,
     use_local_indexer_varlen: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
@@ -204,6 +205,7 @@ def run_fused_dsa_attention(
         varlen_starts=varlen_starts,
         varlen_ends=varlen_ends,
         key_positions=key_positions,
+        query_valid_rows=query_valid_rows,
         use_relu=use_relu,
         use_local_indexer_varlen=use_local_indexer_varlen,
     )
