@@ -1715,7 +1715,6 @@ class DSAttention(MegatronModule):
         use_local_indexer_varlen = (
             packed_thd
             and cp_size > 1
-            and single_packed_thd_sequence
             and attn_mask_type == AttnMaskType.causal
             and varlen_starts is not None
             and varlen_ends is not None
