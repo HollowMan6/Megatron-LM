@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from importlib import import_module
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -23,6 +24,7 @@ _BACKEND_MODULE_NAME_BY_BACKEND = {
 }
 _BACKEND: Optional[ModuleType] = None
 _BACKEND_SELECTION: Optional[str] = None
+_LOGGER = logging.getLogger(__name__)
 
 
 def _get_dsa_kernel_backend(config: TransformerConfig) -> str:
@@ -60,6 +62,18 @@ def _load_backend(config: TransformerConfig) -> Optional[ModuleType]:
     return _BACKEND
 
 
+def _log_declined_hook(config: TransformerConfig, hook_name: str, reason: str) -> None:
+    """Emit one debug breadcrumb when a selected fused hook falls back."""
+    if not _LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    _LOGGER.debug(
+        "DSA fused backend %s %s declined; falling back (%s).",
+        _get_dsa_kernel_backend(config),
+        hook_name,
+        reason,
+    )
+
+
 def use_fused_dsa_kernels(config: TransformerConfig) -> bool:
     """Return whether DSA should attempt optional fused kernels before falling back."""
     backend = config.attention_backend
@@ -86,10 +100,14 @@ def run_fused_qk_topk(
         return None
     fn = getattr(backend, "run_fused_qk_topk", None)
     if fn is None:
+        _log_declined_hook(config, "run_fused_qk_topk", "hook is not implemented")
         return None
-    return fn(
+    result = fn(
         q, k, weights, index_topk, starts, ends, block_size, use_relu, use_local_indexer_varlen
     )
+    if result is None:
+        _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
+    return result
 
 
 def run_fused_qk_topk_with_loss(
@@ -117,8 +135,9 @@ def run_fused_qk_topk_with_loss(
         return None
     fn = getattr(backend, "run_fused_qk_topk_with_loss", None)
     if fn is None:
+        _log_declined_hook(config, "run_fused_qk_topk_with_loss", "hook is not implemented")
         return None
-    return fn(
+    result = fn(
         config=config,
         q=q,
         k=k,
@@ -137,6 +156,9 @@ def run_fused_qk_topk_with_loss(
         use_relu=use_relu,
         use_local_indexer_varlen=use_local_indexer_varlen,
     )
+    if result is None:
+        _log_declined_hook(config, "run_fused_qk_topk_with_loss", "backend returned None")
+    return result
 
 
 def run_fused_absorbed_sparse_attention(
@@ -154,8 +176,12 @@ def run_fused_absorbed_sparse_attention(
         return None
     fn = getattr(backend, "run_fused_absorbed_sparse_attention", None)
     if fn is None:
+        _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "hook is not implemented")
         return None
-    return fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    if result is None:
+        _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
+    return result
 
 
 def run_fused_dsa_attention(
@@ -191,8 +217,9 @@ def run_fused_dsa_attention(
         return None
     fn = getattr(backend, "run_fused_dsa_attention", None)
     if fn is None:
+        _log_declined_hook(config, "run_fused_dsa_attention", "hook is not implemented")
         return None
-    return fn(
+    result = fn(
         config=config,
         query=query,
         key=key,
@@ -218,6 +245,9 @@ def run_fused_dsa_attention(
         use_local_indexer_varlen=use_local_indexer_varlen,
         pg_collection=pg_collection,
     )
+    if result is None:
+        _log_declined_hook(config, "run_fused_dsa_attention", "backend returned None")
+    return result
 
 
 __all__ = [
