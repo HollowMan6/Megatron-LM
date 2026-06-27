@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -452,6 +453,75 @@ def test_dsa_kernel_hooks_return_none_without_backend_function(monkeypatch):
     )
 
 
+def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
+    class Config:
+        attention_backend = "auto"
+        dsa_kernel_backend = "tilelang"
+
+    q = torch.zeros((1, 1, 1, 1))
+    starts = torch.tensor([0], dtype=torch.int32)
+    ends = torch.tensor([1], dtype=torch.int32)
+
+    monkeypatch.setattr(
+        dsa_kernels,
+        "_load_backend",
+        lambda _config: SimpleNamespace(
+            run_fused_qk_topk=lambda *_args: None,
+            run_fused_qk_topk_with_loss=lambda **_kwargs: None,
+            run_fused_absorbed_sparse_attention=lambda *_args: None,
+            run_fused_dsa_attention=lambda **_kwargs: None,
+        ),
+    )
+    caplog.set_level(logging.DEBUG, logger=dsa_kernels.__name__)
+
+    assert dsa_kernels.run_fused_qk_topk(Config, q, q, q[..., 0], 1, starts, ends, 128) is None
+    assert (
+        dsa_kernels.run_fused_qk_topk_with_loss(
+            Config, q, q, q[..., 0], 1, starts, ends, 128, q, q, 1.0, 0.01, object()
+        )
+        is None
+    )
+    assert (
+        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, starts.view(1, 1, 1), 1.0, 1)
+        is None
+    )
+    assert (
+        dsa_kernels.run_fused_dsa_attention(
+            config=Config,
+            query=q,
+            key=q,
+            value=None,
+            up_v_weight=None,
+            q_indexer=q,
+            k_indexer=q[..., 0],
+            indexer_weights=q[..., 0],
+            indexer_topk=1,
+            softmax_scale=1.0,
+            loss_coeff=0.0,
+            sparse_loss=False,
+            calculate_per_token_loss=False,
+            absorbed_mla=True,
+            cp_size=1,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=None,
+            query_valid_rows=None,
+            use_relu=True,
+        )
+        is None
+    )
+    for hook_name in (
+        "run_fused_qk_topk",
+        "run_fused_qk_topk_with_loss",
+        "run_fused_absorbed_sparse_attention",
+        "run_fused_dsa_attention",
+    ):
+        assert f"DSA fused backend tilelang {hook_name} declined" in caplog.text
+    assert "backend returned None" in caplog.text
+
+
 def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     class Config:
         attention_backend = "auto"
@@ -642,6 +712,38 @@ class TestDSACPPositionHelpers:
                 cp_group=fake_cp_group,
                 device=torch.device("cpu"),
             )
+
+    def test_nonpacked_allgather_cp_checks_cuda_lengths(self, monkeypatch):
+        """Non-packed CP length validation should not skip CUDA/NCCL-style groups."""
+        local_lengths = [3, 5]
+        fake_cp_group = _FakeCPGroup(len(local_lengths))
+        seen_devices = []
+        real_tensor = torch.tensor
+
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+        def _fake_tensor(data, *, device=None, dtype=None, **kwargs):
+            seen_devices.append(torch.device(device) if device is not None else None)
+            return real_tensor(data, dtype=dtype, **kwargs)
+
+        def _fake_all_gather(out, local_len, group=None):
+            del local_len, group
+            for i, tensor in enumerate(out):
+                tensor.fill_(local_lengths[i])
+
+        monkeypatch.setattr(torch, "tensor", _fake_tensor)
+        monkeypatch.setattr(torch.distributed, "all_gather", _fake_all_gather)
+
+        with pytest.raises(RuntimeError, match="uniform per-rank sequence lengths"):
+            _validate_nonpacked_cp_uniform_length(
+                sq=local_lengths[1],
+                skv=local_lengths[1],
+                cp_size=len(local_lengths),
+                cp_group=fake_cp_group,
+                device=torch.device("cuda"),
+            )
+        assert seen_devices == [torch.device("cuda")]
 
     def test_position_based_causal_mask(self):
         """Position-based causal mask should mask keys with strictly larger positions."""
@@ -1042,36 +1144,55 @@ class TestDSACPPositionHelpers:
         assert key.grad is not None and torch.isfinite(key.grad).all()
         assert value.grad is not None and torch.isfinite(value.grad).all()
 
-    def test_fused_bounds_disable_on_per_batch_mask_mismatch(self):
-        """Fused bounds should disable when batched masks are not identical."""
+    def test_fused_bounds_use_identity_varlen_without_key_positions(self):
+        """Identity key positions are represented by key_positions=None for fused bounds."""
+        sq, skv = 5, 7
+        starts = torch.zeros(sq, dtype=torch.int64)
+        ends = torch.arange(1, sq + 1, dtype=torch.int64)
+        out = build_fused_indexer_varlen_bounds(
+            sq=sq,
+            skv=skv,
+            device=starts.device,
+            mask=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=None,
+        )
+        assert out is not None
+        starts_i32, ends_i32 = out
+        torch.testing.assert_close(starts_i32, starts.to(dtype=torch.int32))
+        torch.testing.assert_close(ends_i32, ends.to(dtype=torch.int32))
+
+        explicit_identity = build_fused_indexer_varlen_bounds(
+            sq=sq,
+            skv=skv,
+            device=starts.device,
+            mask=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=torch.arange(skv, dtype=torch.int64),
+        )
+        assert explicit_identity is None
+
+    def test_fused_bounds_decline_explicit_additive_mask(self):
+        """Explicit additive masks avoid GPU equality checks by declining fused bounds."""
         sq, skv, bsz = 5, 7, 2
         base_mask = torch.triu(
             torch.full((sq, skv), float("-inf"), dtype=torch.float32), diagonal=1
         )
         mask = base_mask.unsqueeze(0).expand(bsz, -1, -1).clone()
-        out = build_fused_indexer_varlen_bounds(
-            sq=sq,
-            skv=skv,
-            device=mask.device,
-            mask=mask,
-            varlen_starts=None,
-            varlen_ends=None,
-            key_positions=None,
+        assert (
+            build_fused_indexer_varlen_bounds(
+                sq=sq,
+                skv=skv,
+                device=mask.device,
+                mask=mask,
+                varlen_starts=None,
+                varlen_ends=None,
+                key_positions=None,
+            )
+            is None
         )
-        assert out is not None
-
-        # Change one batch mask so masks are no longer identical.
-        mask[1, 0, 0] = float("-inf")
-        out_mismatch = build_fused_indexer_varlen_bounds(
-            sq=sq,
-            skv=skv,
-            device=mask.device,
-            mask=mask,
-            varlen_starts=None,
-            varlen_ends=None,
-            key_positions=None,
-        )
-        assert out_mismatch is None
 
     def test_scatter_topk_chunked_matches_manual_with_negative_indices(self):
         """Chunked top-k scatter should match manual behavior for -1 invalid indices."""

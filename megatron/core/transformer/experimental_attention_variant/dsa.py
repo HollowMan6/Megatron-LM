@@ -1855,16 +1855,17 @@ class DSAttention(MegatronModule):
                 topk_length = topk_length_holder.get(self.source_layer)
         else:
             assert self.indexer is not None
-            q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
-            if cp_size > 1 and k.size(0) == sq:
-                k = gather_from_sequence_parallel_region(k, group=cp_group)
-                if kv_reorder_idx is not None:
-                    if k.size(0) != kv_reorder_idx.numel():
-                        raise RuntimeError(
-                            "DSA gathered indexer-key length mismatch: "
-                            f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
-                        )
-                    k = k.index_select(0, kv_reorder_idx)
+            with torch.enable_grad() if use_indexer_loss else torch.no_grad():
+                q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                if cp_size > 1 and k.size(0) == sq:
+                    k = gather_from_sequence_parallel_region(k, group=cp_group)
+                    if kv_reorder_idx is not None:
+                        if k.size(0) != kv_reorder_idx.numel():
+                            raise RuntimeError(
+                                "DSA gathered indexer-key length mismatch: "
+                                f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
+                            )
+                        k = k.index_select(0, kv_reorder_idx)
 
         def compute_indexer_loss_with_reference_path():
             key_for_loss = key.detach()
