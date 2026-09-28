@@ -111,7 +111,12 @@ class Engram(MegatronModule):
         key = key.float().unflatten(-1, (self.n, self.hidden_size))
         h = hidden_states.float().unflatten(-1, (self.n, self.hidden_size))
         eps = self.config.layernorm_epsilon
-        rstd = (h.square().mean(-1) + eps).rsqrt() * (key.square().mean(-1) + eps).rsqrt()
+        # Use the norm form to avoid retaining a full fp32 square activation for
+        # backward; it is equivalent to the original RMS expression.
+        K = h.shape[-1]
+        h_norm = h.norm(dim=-1)
+        k_norm = key.norm(dim=-1)
+        rstd = torch.rsqrt(h_norm * h_norm / K + eps) * torch.rsqrt(k_norm * k_norm / K + eps)
         dot = (h * key * self.q_weight.float() * self.k_weight.float()).sum(-1)
         dot = dot * rstd * self.hidden_size**-0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))

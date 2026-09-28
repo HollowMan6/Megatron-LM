@@ -384,7 +384,11 @@ class HyperConnectionModule(MegatronModule):
         # operations without changing the zero/small-input gradient.
         with torch.autocast(device_type=x.device.type, enabled=False):
             projected = F.linear(x, self.mapping_proj.weight.float())
-        projected = projected * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        # Use the norm form to avoid retaining a full fp32 square activation for
+        # backward; it is equivalent to rsqrt(mean(x**2) + eps).
+        K = x.shape[-1]
+        rms = x.norm(dim=-1, keepdim=True) * (1.0 / math.sqrt(K))
+        projected = projected * torch.rsqrt(rms * rms + self.norm_eps)
         pre = (projected[..., : self.n] * self.alpha_pre + self.bias[: self.n]).sigmoid()
         post = (
             projected[..., self.n : 2 * self.n] * self.alpha_post + self.bias[self.n : 2 * self.n]
@@ -615,7 +619,13 @@ class HyperConnectionModule(MegatronModule):
         if self.single_pass:
             if mhc_state is None:
                 raise ValueError("Single-pass mHC requires a forward-local SinglePassMHCState")
-            h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+            # Recompute the fp32 projection in backward instead of retaining its
+            # token-sized intermediates for every layer.
+            from megatron.core import tensor_parallel
+
+            h_pre, h_post, h_res = tensor_parallel.checkpoint(
+                self.compute_mappings, False, hidden_states
+            )
             if mhc_recompute_manager is None:
                 aggregated = self._single_pass_aggregate(hidden_states, mhc_state.pre_mix)
             else:
@@ -830,15 +840,13 @@ class HyperConnectionModule(MegatronModule):
     ) -> Tensor:
         """Apply residual mixing and branch expansion once, preserving FP32 coefficients."""
         with torch.autocast(device_type=x.device.type, enabled=False):
-            streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
             if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
-                return (
-                    self._h_post_bda_op(
-                        h_res, streams, h_post, x.float(), None if bias is None else bias.float()
-                    )
-                    .flatten(-2)
-                    .to(x.dtype)
-                )
+                # The fused kernel performs its own fp32 conversion, so pass the
+                # original dtype and avoid extra token-sized fp32 temporaries.
+                streams = original_residual.unflatten(-1, (self.n, self.hidden_size))
+                out = self._h_post_bda_op(h_res, streams, h_post, x, bias)
+                return out.flatten(-2).to(x.dtype)
+            streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
             mixed = torch.einsum("sbij,sbic->sbjc", h_res.float(), streams)
             branch = x.float() if bias is None else x.float() + bias.float()
             expanded = h_post.float().unsqueeze(-1) * branch.unsqueeze(-2)

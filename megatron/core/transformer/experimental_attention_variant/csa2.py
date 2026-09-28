@@ -301,11 +301,31 @@ class CSA2Indexer(MegatronModule):
         q = _apply_rope(q, rotary_seq_len=q.shape[0], **rope_kwargs)
         weights, _ = self.linear_weights_proj(x)
         weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
-        scores = torch.einsum("sbhd,tbd->bsht", q.float(), indexer_k.float()).relu()
-        scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
-        visible = torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
-        causal = torch.arange(indexer_k.shape[0], device=x.device)[None, :] < visible[:, None]
-        scores = scores.masked_fill(~causal, -torch.inf)
+        seq_len = x.shape[0]
+        num_keys = indexer_k.shape[0]
+        per_query_bytes = x.shape[1] * self.n_heads * num_keys * 4
+        # 128 MiB per-chunk transient cap; fall back to whole-sequence when the
+        # transient is already below the cap or the batch is degenerate.
+        budget_bytes = 128 * (1024 ** 2)
+        if per_query_bytes > 0 and per_query_bytes * seq_len > budget_bytes:
+            chunk = max(1, budget_bytes // per_query_bytes)
+        else:
+            chunk = seq_len
+        chunk = min(chunk, seq_len)
+        q_f = q.float()
+        weights_p = weights.permute(1, 0, 2).unsqueeze(-1)  # [b, s, h, 1]
+        indexer_k_f = indexer_k.float()
+        visible = torch.arange(1, seq_len + 1, device=x.device) // self.compress_ratio
+        key_pos = torch.arange(num_keys, device=x.device)
+        score_chunks = []
+        for i in range(0, seq_len, chunk):
+            j = min(i + chunk, seq_len)
+            st = torch.einsum("sbhd,tbd->bsht", q_f[i:j], indexer_k_f).relu()  # [b, c, h, t]
+            st = (st * weights_p[:, i:j]).sum(dim=2)  # [b, c, t]
+            causal_c = key_pos[None, :] < visible[i:j, None]
+            st = st.masked_fill(~causal_c, -torch.inf)
+            score_chunks.append(st)
+        scores = torch.cat(score_chunks, dim=1) if len(score_chunks) > 1 else score_chunks[0]
         if isinstance(candidates, CSA2CandidateBlocks):
             candidates = candidates.to_mask(scores.shape[-1])
         if candidates is not None:
