@@ -2562,22 +2562,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
 
-        stateful_csa2_recompute = (
-            self.experimental_attention_variant == "dsv4_hybrid"
-            and self.dsv4_version == "v4.1"
-            and self.mhc_single_pass
-        )
-        if (
-            self.enable_mhc_connections
-            and self.recompute_granularity == "full"
-            and not stateful_csa2_recompute
-        ):
-            raise NotImplementedError(
-                "enable_mhc_connections is not yet compatible with full activation recompute. "
-                "Use selective recompute with 'mhc' in recompute_modules, or disable "
-                "activation recompute."
-            )
-
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(
                 "enable_mhc_connections is not compatible with inference_fuse_tp_communication. "
