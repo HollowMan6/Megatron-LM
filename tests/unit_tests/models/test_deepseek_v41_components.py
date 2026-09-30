@@ -123,3 +123,22 @@ def test_dspark_confidence_targets_use_distribution_overlap():
         select_verification_length(torch.tensor([[0.9, 0.1]]), torch.tensor([1.0, 2.0])),
         torch.tensor([1]),
     )
+
+
+def test_modality_router_keeps_dispatch_rows_but_zeros_padding_probabilities(groups):
+    config = tiny_config()
+    router = ModalityRouter(config, groups).cuda()
+    with torch.no_grad():
+        router.weight.zero_()
+        router.text_balance.expert_bias.copy_(torch.tensor([4, 3, 2, 1], device="cuda"))
+        router.image_balance.expert_bias.copy_(torch.tensor([1, 2, 3, 4], device="cuda"))
+    probs, route = router(
+        torch.ones(3, 1, 32, device="cuda"),
+        padding_mask=torch.tensor([[False], [False], [True]], device="cuda"),
+        image_mask=torch.tensor([[False], [True], [False]], device="cuda"),
+    )
+    torch.testing.assert_close(route.sum(-1), torch.full((3,), 2, device="cuda"))
+    torch.testing.assert_close(probs[:2].sum(-1), torch.full((2,), 1.5, device="cuda"))
+    torch.testing.assert_close(probs[2], torch.zeros(4, device="cuda"))
+    assert router.text_balance.local_tokens_per_expert.sum() == 2
+    assert router.image_balance.local_tokens_per_expert.sum() == 2
