@@ -50,6 +50,23 @@ else:
     TEColumnParallelLinear, TELinear, set_save_original_input = (None, None, None)
 
 
+def _fp8_round_trip(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """The DSv4 reference's act_quant(x, 32, 'ue8m0', e8m0fnu, inplace=True):
+    block-wise FP8 quantize-dequantize emulating the training-time activation
+    quantization (inference/kernel.py act_quant_kernel). Per 32-element block
+    along the last dim: absmax scale clamped to >=1e-4 and rounded UP to a
+    power of two (the e8m0 storage format), values quantized to e4m3 and
+    dequantized back, internal computation in FP32."""
+    shape = x.shape
+    N = shape[-1]
+    assert N % block_size == 0, f"last dim {N} not divisible by {block_size}"
+    blocks = x.float().reshape(-1, block_size)
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    q = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+    return (q * scale).to(x.dtype).reshape(shape)
+
+
 @torch.compile
 def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Fused RMS normalization for query tensor (no learnable weight)."""
@@ -449,6 +466,10 @@ class DSv4HybridAttention(Attention):
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
+        # DSv4 reference (inference/model.py, the wo_a einsum site):
+        # quantize/dequantize o before the einsum - the training-time FP8
+        # activation emulation.
+        core_attn_out = _fp8_round_trip(core_attn_out)
         linear_o_group_proj = self.linear_o_group_proj
         if isinstance(linear_o_group_proj, torch.nn.Module):
             # LoRA promotes this replicated parameter to a wrapped linear
@@ -732,6 +753,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     remove_interleaving=True,
                     position_ids=kv_positions,
                 )
+                # DSv4 reference (inference/model.py _window_kv): the K stays
+                # fp8, quantized over the whole post-RoPE vector, RoPE tail
+                # included. Emulate the training-time quantization.
+                kv = _fp8_round_trip(kv)
             else:
                 q_len = q.size()[0]
                 # Keep direct forward calls with shorter sequences aligned to their inputs.
@@ -784,6 +809,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]
                 kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
+                # DSv4 reference (inference/model.py _window_kv): the K stays
+                # fp8, quantized over the whole post-RoPE vector, RoPE tail
+                # included. Emulate the training-time quantization.
+                kv = _fp8_round_trip(kv)
             if halo_rows:
                 boundary_kv, kv = kv[:halo_rows], kv[halo_rows:]
             else:

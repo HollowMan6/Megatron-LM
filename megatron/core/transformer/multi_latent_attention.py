@@ -111,6 +111,23 @@ if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
 
 
+def _fp8_round_trip(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """The DSv4 reference's act_quant(x, 32, 'ue8m0', e8m0fnu, inplace=True)
+    (inference/kernel.py act_quant_kernel): block-wise FP8 quantize-dequantize
+    emulating the training-time activation quantization. Per 32-element block
+    along the last dim: absmax scale clamped to >=1e-4 and rounded UP to a
+    power of two (the e8m0 storage format), values quantized to e4m3 and
+    dequantized back, internal computation in FP32."""
+    shape = x.shape
+    N = shape[-1]
+    assert N % block_size == 0, f"last dim {N} not divisible by {block_size}"
+    blocks = x.float().reshape(-1, block_size)
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    q = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+    return (q * scale).to(x.dtype).reshape(shape)
+
+
 class _QuantizeKVForFusedAttn(torch.autograd.Function):
     """Bridge the autograd graph across mxfp8_quantize_only's tensor reconstruction."""
 
@@ -912,6 +929,11 @@ class MLASelfAttention(MultiLatentAttention):
             # Create KV cache entry. It will the be the key vector in cache mla latents path
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
             kv_cached = torch.cat([kv_compressed, k_pos_emb_squeezed], dim=-1)
+            # DSv4 reference (inference/model.py _window_kv) and nemo_automodel
+            # (attention.py: kv = quantize_cache(..., format="fp8", block_size=32)):
+            # the K stays fp8, quantized over the whole post-RoPE vector, RoPE
+            # tail included. Emulate the training-time quantization.
+            kv_cached = _fp8_round_trip(kv_cached)
 
             # Flag for whether to use absorption. We only use absorption
             # when caching the latents and in decode-only mode
@@ -1103,6 +1125,12 @@ class MLASelfAttention(MultiLatentAttention):
                     assert k_pos_emb.ndim == 3
                     k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
                 key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                # DSv4 reference (inference/model.py _window_kv: "the K stays
+                # fp8, quantized over the whole post-RoPE vector, RoPE tail
+                # included") and nemo_automodel (attention.py quantize_cache
+                # format="fp8"): emulate the training-time KV quantization.
+                key = _fp8_round_trip(key)
+                value = _fp8_round_trip(value)
 
             if not use_fused_q_uproj:
                 query = query.contiguous()

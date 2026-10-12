@@ -33,6 +33,23 @@ except ImportError:
     hadamard_transform = None
 
 
+def _fp8_round_trip(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """The DSv4 reference's act_quant(x, 32, 'ue8m0', e8m0fnu, inplace=True)
+    (inference/kernel.py act_quant_kernel): block-wise FP8 quantize-dequantize
+    emulating the training-time activation quantization. Per 32-element block
+    along the last dim: absmax scale clamped to >=1e-4 and rounded UP to a
+    power of two (the e8m0 storage format), values quantized to e4m3 and
+    dequantized back, internal computation in FP32."""
+    shape = x.shape
+    N = shape[-1]
+    assert N % block_size == 0, f"last dim {N} not divisible by {block_size}"
+    blocks = x.float().reshape(-1, block_size)
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    q = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+    return (q * scale).to(x.dtype).reshape(shape)
+
+
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
     """Return whether a 1-indexed layer reuses a previous DSA top-k result."""
     if layer_number < 1:
@@ -169,6 +186,10 @@ def _run_sparse_attention(
                 key_positions=key_positions,
             )
         assert output is not None
+        # DSv4 reference (inference/model.py, the wo_a einsum site):
+        # quantize/dequantize o before the value-up einsum - the training-time
+        # FP8 activation emulation.
+        output = _fp8_round_trip(output)
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
         return output
