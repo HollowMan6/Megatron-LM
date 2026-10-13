@@ -52,8 +52,7 @@ else:
 
 def _fp8_round_trip(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     """The DSv4 reference's act_quant(x, 32, 'ue8m0', e8m0fnu, inplace=True):
-    block-wise FP8 quantize-dequantize emulating the training-time activation
-    quantization (inference/kernel.py act_quant_kernel). Per 32-element block
+    block-wise FP8 quantize-dequantize of the SERVING-side KV/o quantization (gated by kv_fp8_emulation, default OFF) (inference/kernel.py act_quant_kernel). Per 32-element block
     along the last dim: absmax scale clamped to >=1e-4 and rounded UP to a
     power of two (the e8m0 storage format), values quantized to e4m3 and
     dequantized back, internal computation in FP32."""
@@ -467,9 +466,11 @@ class DSv4HybridAttention(Attention):
             core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
         # DSv4 reference (inference/model.py, the wo_a einsum site):
-        # quantize/dequantize o before the einsum - the training-time FP8
-        # activation emulation.
-        core_attn_out = _fp8_round_trip(core_attn_out)
+        # quantize/dequantize o before the einsum. OFF by default: serving-side
+        # behavior; the 2026-10-13 ablation showed it degrades training
+        # convergence (see TransformerConfig.kv_fp8_emulation).
+        if self.config.kv_fp8_emulation:
+            core_attn_out = _fp8_round_trip(core_attn_out)
         linear_o_group_proj = self.linear_o_group_proj
         if isinstance(linear_o_group_proj, torch.nn.Module):
             # LoRA promotes this replicated parameter to a wrapped linear
@@ -755,8 +756,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 )
                 # DSv4 reference (inference/model.py _window_kv): the K stays
                 # fp8, quantized over the whole post-RoPE vector, RoPE tail
-                # included. Emulate the training-time quantization.
-                kv = _fp8_round_trip(kv)
+                # included. OFF by default: serving-side behavior; the
+                # 2026-10-13 ablation showed it degrades training convergence
+                # (see TransformerConfig.kv_fp8_emulation).
+                if self.config.kv_fp8_emulation:
+                    kv = _fp8_round_trip(kv)
             else:
                 q_len = q.size()[0]
                 # Keep direct forward calls with shorter sequences aligned to their inputs.
@@ -811,8 +815,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
                 # DSv4 reference (inference/model.py _window_kv): the K stays
                 # fp8, quantized over the whole post-RoPE vector, RoPE tail
-                # included. Emulate the training-time quantization.
-                kv = _fp8_round_trip(kv)
+                # included. OFF by default: serving-side behavior; the
+                # 2026-10-13 ablation showed it degrades training convergence
+                # (see TransformerConfig.kv_fp8_emulation).
+                if self.config.kv_fp8_emulation:
+                    kv = _fp8_round_trip(kv)
             if halo_rows:
                 boundary_kv, kv = kv[:halo_rows], kv[halo_rows:]
             else:

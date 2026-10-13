@@ -378,6 +378,21 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_rotate_activation: bool = True
     """Whether DSA indexer should apply Hadamard rotate_activation to q/k before scoring."""
 
+    kv_fp8_emulation: bool = False
+    """Whether attention paths emulate the DSv4 reference's block-wise FP8 KV/o
+    quantize-dequantize round-trip (act_quant: e4m3 values, 32-element blocks,
+    e8m0 scales).
+
+    DEFAULT OFF for training. A 2026-10-13 ablation (SlimOrca, 240 optimizer steps,
+    fork-vs-Tinker trajectory with matched LoRA surface, optimizer, and data) showed the
+    round-trip in the training path degrades convergence: the fork/Tinker epoch-2 loss
+    ratio was 1.265 with the emulation vs 1.088 without, and the first 60 steps reached
+    parity (0.998) without it. The reference platform's training forward carries no such
+    quantization — the FP8 KV cache format is serving-side behavior (the inference
+    kernel's cache layout), and emulating it during training injects quantization noise
+    into every forward/backward. Opt in only when specifically studying serving-path
+    numerics in an inference-only context."""
+
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 

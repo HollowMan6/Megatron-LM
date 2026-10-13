@@ -114,10 +114,12 @@ if TYPE_CHECKING:
 def _fp8_round_trip(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     """The DSv4 reference's act_quant(x, 32, 'ue8m0', e8m0fnu, inplace=True)
     (inference/kernel.py act_quant_kernel): block-wise FP8 quantize-dequantize
-    emulating the training-time activation quantization. Per 32-element block
-    along the last dim: absmax scale clamped to >=1e-4 and rounded UP to a
-    power of two (the e8m0 storage format), values quantized to e4m3 and
-    dequantized back, internal computation in FP32."""
+    of the SERVING-side KV cache format. Per 32-element block along the last
+    dim: absmax scale clamped to >=1e-4 and rounded UP to a power of two (the
+    e8m0 storage format), values quantized to e4m3 and dequantized back,
+    internal computation in FP32. Gated by TransformerConfig.kv_fp8_emulation
+    (default OFF): a 2026-10-13 ablation showed applying it during training
+    degrades convergence."""
     shape = x.shape
     N = shape[-1]
     assert N % block_size == 0, f"last dim {N} not divisible by {block_size}"
@@ -932,8 +934,11 @@ class MLASelfAttention(MultiLatentAttention):
             # DSv4 reference (inference/model.py _window_kv) and nemo_automodel
             # (attention.py: kv = quantize_cache(..., format="fp8", block_size=32)):
             # the K stays fp8, quantized over the whole post-RoPE vector, RoPE
-            # tail included. Emulate the training-time quantization.
-            kv_cached = _fp8_round_trip(kv_cached)
+            # tail included. OFF by default: this is serving-side behavior and the
+            # 2026-10-13 ablation showed it degrades training convergence (see
+            # TransformerConfig.kv_fp8_emulation).
+            if self.config.kv_fp8_emulation:
+                kv_cached = _fp8_round_trip(kv_cached)
 
             # Flag for whether to use absorption. We only use absorption
             # when caching the latents and in decode-only mode
@@ -1128,9 +1133,12 @@ class MLASelfAttention(MultiLatentAttention):
                 # DSv4 reference (inference/model.py _window_kv: "the K stays
                 # fp8, quantized over the whole post-RoPE vector, RoPE tail
                 # included") and nemo_automodel (attention.py quantize_cache
-                # format="fp8"): emulate the training-time KV quantization.
-                key = _fp8_round_trip(key)
-                value = _fp8_round_trip(value)
+                # format="fp8"). OFF by default: serving-side behavior; the
+                # 2026-10-13 ablation showed it degrades training convergence
+                # (see TransformerConfig.kv_fp8_emulation).
+                if self.config.kv_fp8_emulation:
+                    key = _fp8_round_trip(key)
+                    value = _fp8_round_trip(value)
 
             if not use_fused_q_uproj:
                 query = query.contiguous()

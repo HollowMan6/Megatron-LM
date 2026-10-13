@@ -36,7 +36,7 @@ except ImportError:
 def _fp8_round_trip(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     """The DSv4 reference's act_quant(x, 32, 'ue8m0', e8m0fnu, inplace=True)
     (inference/kernel.py act_quant_kernel): block-wise FP8 quantize-dequantize
-    emulating the training-time activation quantization. Per 32-element block
+    of the SERVING-side KV/o quantization (gated by kv_fp8_emulation, default OFF). Per 32-element block
     along the last dim: absmax scale clamped to >=1e-4 and rounded UP to a
     power of two (the e8m0 storage format), values quantized to e4m3 and
     dequantized back, internal computation in FP32."""
@@ -187,9 +187,11 @@ def _run_sparse_attention(
             )
         assert output is not None
         # DSv4 reference (inference/model.py, the wo_a einsum site):
-        # quantize/dequantize o before the value-up einsum - the training-time
-        # FP8 activation emulation.
-        output = _fp8_round_trip(output)
+        # quantize/dequantize o before the value-up einsum. OFF by default:
+        # serving-side behavior; the 2026-10-13 ablation showed it degrades
+        # training convergence (see TransformerConfig.kv_fp8_emulation).
+        if config.kv_fp8_emulation:
+            output = _fp8_round_trip(output)
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
         return output
