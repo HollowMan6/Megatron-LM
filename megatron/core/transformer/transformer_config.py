@@ -383,15 +383,26 @@ class TransformerConfig(ModelParallelConfig):
     quantize-dequantize round-trip (act_quant: e4m3 values, 32-element blocks,
     e8m0 scales).
 
-    DEFAULT OFF for training. A 2026-10-13 ablation (SlimOrca, 240 optimizer steps,
-    fork-vs-Tinker trajectory with matched LoRA surface, optimizer, and data) showed the
-    round-trip in the training path degrades convergence: the fork/Tinker epoch-2 loss
-    ratio was 1.265 with the emulation vs 1.088 without, and the first 60 steps reached
-    parity (0.998) without it. The reference platform's training forward carries no such
-    quantization — the FP8 KV cache format is serving-side behavior (the inference
-    kernel's cache layout), and emulating it during training injects quantization noise
-    into every forward/backward. Opt in only when specifically studying serving-path
-    numerics in an inference-only context."""
+    DEFAULT OFF. Two facts pull in different directions and neither alone
+    settles the flag:
+
+    - Training-service parity requires OFF: a 2026-10-13 ablation (SlimOrca,
+      240 optimizer steps, matched surface/optimizer/data) showed the
+      reference training service's forward carries no such quantization —
+      with the emulation the fork/service epoch-2 loss ratio was 1.265 (and
+      gradient norms damped ~20%), without it 1.088 with first-60-step
+      parity at 0.998.
+    - The deployed serving path DOES quantize (the KV cache format and the
+      attention-output quantization are serving-side behavior), so training
+      with the round-trip enabled is a QAT-style option that MIGHT yield an
+      adapter better matched to the quantized serving graph — at a training
+      convergence cost. Whether the serving-time transfer benefit outweighs
+      that cost is an open empirical question (untested); the service's own
+      choice not to quantize during training is an implementation choice,
+      not ground truth.
+
+    Enable only for deliberate QAT-style experiments or serving-numerics
+    study; keep OFF for training-service parity."""
 
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
