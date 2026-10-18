@@ -1895,8 +1895,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
             else:
                 n = self.config.mhc_num_residual_streams
-                hidden_states = hidden_states.unflatten(-1, (n, self.config.hidden_size)).mean(
-                    dim=-2
+                # fp32 accumulation for the stream-average contract (slime-align;
+                # see HyperConnectionModule.output_contract for the rationale).
+                hidden_states = (
+                    hidden_states.unflatten(-1, (n, self.config.hidden_size))
+                    .float()
+                    .mean(dim=-2)
+                    .to(hidden_states.dtype)
                 )
 
         # Layer norm before shared head layer.
