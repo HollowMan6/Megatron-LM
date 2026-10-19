@@ -432,6 +432,123 @@ def test_thd_cp_matches_unsplit_forward_and_gradients(ratio, backend):
         Utils.inited = False
 
 
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_thd_cp_indexer_loss_matches_unsplit(ratio, per_token, sparse):
+    """Under CP the indexer KL loss stays exact: the tracker receives the CP group
+    so its flush averages the per-shard token means into the unsplit value, and
+    the indexer K-projection gradients average (mean mode) or sum (per-token
+    mode) across shards to the unsplit gradient."""
+    if Utils.world_size not in (2, 4):
+        pytest.skip("run with torchrun --nproc-per-node=2 or 4")
+    world = Utils.world_size
+    Utils.initialize_model_parallel(context_parallel_size=world)
+    model_parallel_cuda_manual_seed(1234)
+    groups = ProcessGroupCollection.use_mpu_process_groups()
+    singleton_groups = [torch.distributed.new_group([rank]) for rank in range(world)]
+    reference_groups = copy(groups)
+    reference_groups.cp = singleton_groups[torch.distributed.get_rank()]
+    try:
+        torch.manual_seed(1234)
+        overrides = {
+            "context_parallel_size": world,
+            "dsa_indexer_loss_coeff": 1.0,
+            "calculate_per_token_loss": per_token,
+            "dsa_indexer_use_sparse_loss": sparse,
+        }
+        dtype = torch.float32
+        distributed_layer = _layer(groups, ratio, dtype, **overrides)
+        overrides["context_parallel_size"] = 1
+        reference_layer = _layer(reference_groups, ratio, dtype, **overrides)
+        reference_layer.load_state_dict(distributed_layer.state_dict())
+        total_rows = 4 * world
+        global_x = torch.randn(
+            total_rows, 1, distributed_layer.config.hidden_size, device="cuda", dtype=dtype
+        )
+        rank = torch.distributed.get_rank()
+        local_x = global_x[rank * 4 : (rank + 1) * 4].detach().clone().requires_grad_()
+        reference_x = global_x.detach().clone().requires_grad_()
+        logical = torch.tensor([0, 3, total_rows], device="cuda", dtype=torch.int32)
+        packed_cp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            max_seqlen_q=total_rows - 3,
+            max_seqlen_kv=total_rows - 3,
+            cp_partition_mode="contiguous",
+        )
+        packed_ref = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            max_seqlen_q=total_rows - 3,
+            max_seqlen_kv=total_rows - 3,
+        )
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        actual, _ = distributed_layer(local_x, None, packed_seq_params=packed_cp)
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        assert "values" in tracker, "CP forward must log the indexer loss"
+        # This rank's shard mean is stored together with the CP group for the flush;
+        # reduce_group stays empty because the saved value is a token mean in both
+        # reduction modes (unlike the DSA line, which SUMs in per-token mode).
+        assert tracker["avg_group"] is not None
+        assert (
+            torch.distributed.get_process_group_ranks(tracker["avg_group"])
+            == torch.distributed.get_process_group_ranks(groups.cp)
+        )
+        assert tracker["reduce_group"] is None
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
+            distributed_layer.core_attention.pg_collection
+        )
+        distributed_logged = tracker["values"].clone()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        expected, _ = reference_layer(reference_x, None, packed_seq_params=packed_ref)
+        assert DSAIndexerLossLoggingHelper.tracker["avg_group"] is None
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
+            reference_layer.core_attention.pg_collection
+        )
+        reference_logged = DSAIndexerLossLoggingHelper.tracker["values"].clone()
+        # The flushed CP value is the unsplit token mean, and the loss is real.
+        assert reference_logged.abs().sum() > 0
+        torch.testing.assert_close(distributed_logged, reference_logged, atol=1e-4, rtol=1e-4)
+        # Forward parity: the loss attaches without changing the attention output.
+        expected_local = expected[rank * 4 : (rank + 1) * 4]
+        error = (actual - expected_local).abs().amax()
+        torch.distributed.all_reduce(error, op=torch.distributed.ReduceOp.MAX, group=groups.cp)
+        if error > 1e-4:
+            pytest.fail(f"CP forward maximum error {error.item():.6g}")
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        # Indexer K-projection gradients: the loss normalizer differs by mode, so
+        # the shard reduction matching the unsplit gradient is AVG in mean mode
+        # (each shard saves a local mean) and SUM in per-token mode (each shard
+        # saves a raw local sum).
+        distributed_grad = distributed_layer.core_attention.indexer.linear_wk.weight.grad
+        if per_token:
+            torch.distributed.all_reduce(distributed_grad, group=groups.cp)
+        else:
+            torch.distributed.all_reduce(
+                distributed_grad, op=torch.distributed.ReduceOp.AVG, group=groups.cp
+            )
+        reference_grad = reference_layer.core_attention.indexer.linear_wk.weight.grad
+        weight_error = (distributed_grad - reference_grad).abs().amax()
+        grad_scale = reference_grad.abs().amax()
+        torch.distributed.all_reduce(
+            weight_error, op=torch.distributed.ReduceOp.MAX, group=groups.cp
+        )
+        if weight_error > 1e-4 + 1e-2 * grad_scale:
+            pytest.fail(
+                f"CP indexer gradient maximum error {weight_error.item():.6g}, "
+                f"reference maximum {grad_scale.item():.6g}"
+            )
+    finally:
+        from megatron.core import parallel_state
+
+        parallel_state.destroy_model_parallel()
+        Utils.inited = False
+
+
 def _reference_rope(x, config, ratio, position_stride=1, inverse=False):
     dim = config.qk_pos_emb_head_dim
     base = config.csa_compress_rotary_base if ratio else config.rotary_base
@@ -1037,6 +1154,66 @@ def test_reindex_scores_preserve_owner_key_graph_and_candidate_mask(pg_collectio
                 torch.testing.assert_close(parameter.grad, expected_gradient, atol=3e-6, rtol=3e-5)
     assert owner.core_attention.indexer.linear_wk.weight.grad.abs().sum() > 0
     assert reindex.core_attention.indexer.linear_wq_b.weight.grad.abs().sum() > 0
+
+
+def test_select_indices_stable_selection_survives_chunking(monkeypatch):
+    """The chunked selection keeps the stable-argsort contract: lowest index wins
+    ties regardless of the packed width, -1 lands exactly on slots whose own score
+    is masked (interior intervals, rows with fewer visible positions than topk),
+    rows keep their alignment across chunks, and the per-chunk sort calls actually
+    happen at the budgeted size."""
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    topk = 4
+    selector = SimpleNamespace(topk=topk)
+    rows, keys, batch = 7, 24, 2
+    scores = torch.randn(batch, rows, keys, device="cuda", dtype=torch.float32)
+    scores[:, 0, -5:] = -torch.inf  # partial visibility: fewer winners than topk
+    scores[:, 1, :] = -torch.inf  # fully masked row
+    scores[:, 2, 1] = -torch.inf  # hole between valid positions
+    scores[0, 3, :5] = -torch.inf  # interior interval: only {5, 6} visible
+    scores[0, 3, 5:7] = 0.5
+    scores[0, 3, 7:] = -torch.inf
+    selected = CSA2Indexer.select_indices(selector, scores)
+    assert selected.dtype == torch.int32
+    assert selected.shape[-1] == topk
+    valid = selected >= 0
+    assert torch.equal(valid.sum(-1), scores.isfinite().sum(-1).clamp_max(topk))
+    assert torch.equal(selected[0, 3][valid[0, 3]], torch.tensor([5, 6], device="cuda"))
+    # A zero-key matrix (no complete compression group) keeps the empty-selection
+    # contract instead of crashing the chunked path.
+    empty = CSA2Indexer.select_indices(selector, torch.zeros(1, 3, 0, device="cuda"))
+    assert empty.shape == (1, 3, 0) and empty.dtype == torch.int32
+    # The stable tie contract: all-tied visible positions keep the lowest indices.
+    tied = torch.zeros(1, 3, 31, device="cuda", dtype=torch.float32)
+    tied[..., 0, :] = -torch.inf
+    tied[..., 1, 7:] = -torch.inf  # 7 visible positions, all tied at zero
+    tied_selected = CSA2Indexer.select_indices(selector, tied)
+    torch.testing.assert_close(
+        tied_selected[0, 1], torch.arange(topk, device="cuda", dtype=torch.int32)
+    )
+    # topk larger than the key count clamps to the key count.
+    narrow = torch.randn(1, 4, 2, device="cuda", dtype=torch.float32)
+    narrow[..., 0, 1] = -torch.inf
+    narrow_selected = CSA2Indexer.select_indices(selector, narrow)
+    assert narrow_selected.shape[-1] == 2
+    # The chunked sort must both chunk (more than one call, no call above the
+    # budgeted rows) and stay bit-identical to the single-shot stable argsort.
+    monkeypatch.setattr(csa2_module, "_SELECT_ROW_CHUNK_ELEMENTS", 3 * keys)
+    sort_rows = []
+    real_argsort = torch.Tensor.argsort
+
+    def spy(self, *args, **kwargs):
+        sort_rows.append(self.shape[0])
+        return real_argsort(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "argsort", spy)
+    chunked = CSA2Indexer.select_indices(selector, scores)
+    assert len(sort_rows) > 1 and max(sort_rows) <= 3
+    single = real_argsort(scores, dim=-1, descending=True, stable=True)[..., :topk]
+    single = single.sort(dim=-1).values
+    single = single.masked_fill(~scores.gather(-1, single).isfinite(), -1).int()
+    torch.testing.assert_close(chunked, single)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Candidate tensors use CUDA")

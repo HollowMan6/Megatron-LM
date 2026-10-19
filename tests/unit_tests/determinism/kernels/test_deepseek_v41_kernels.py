@@ -252,6 +252,37 @@ def test_csa2_thd_module_replay(groups):
         assert_module_replays_bit_exact(PackedCSA2(), (hidden,))
 
 
+def test_csa2_indexer_select_chunked_replay(monkeypatch):
+    """Replay the row-chunked indexer selection: rows sorted in several chunks
+    (plus a ragged tail) replay bit-identically, with per-row stable ties and
+    row alignment preserved across the chunk boundaries."""
+    from types import SimpleNamespace
+
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+    from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2Indexer
+
+    seeded()
+    keys = 512
+    monkeypatch.setattr(csa2_module, "_SELECT_ROW_CHUNK_ELEMENTS", 128 * keys)
+    rows = 300  # 128-row chunks: two full chunks plus a ragged tail
+    scores = torch.randn(1, rows, keys, device="cuda")
+    scores[..., :64, 8:] = -torch.inf  # early rows see few compressed positions
+    scores[..., 64:128, :] = 0.0  # a fully tied block: stable lowest-index ties
+    scores[..., 200, 100:104] = -torch.inf  # interior holes
+    selector = SimpleNamespace(topk=4)
+
+    def select(scores):
+        return CSA2Indexer.select_indices(selector, scores)
+
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(
+            select,
+            (scores,),
+            backward=False,
+            what="CSA2 chunked indexer selection",
+        )
+
+
 def test_engram_duplicate_rows_replay(groups):
     seeded()
     config = tiny_config()

@@ -126,15 +126,19 @@ backbone routing-bias updates and excludes its parameters from optimizer weight 
 
 ## Execution coverage and limits
 
-This is BF16/FP32 training support with TP=CP=PP=1 and expert/data parallelism.
-Native and fused sparse attention share the same architecture. The native indexer
-is a correctness path: it materializes dense score/candidate tensors and is not
-a million-token performance implementation. GPU tests and the example report
+This is BF16/FP32 training support with TP=PP=1, packed THD sequences, context
+parallel (contiguous partition) over packed THD inputs, full/selective activation
+recompute, and expert/data parallelism. The indexer KL loss works under CP: each
+rank logs its own shard's token mean and the tracker averages the shards over the
+CP group. Native and fused sparse attention share the same architecture. The native
+indexer is a correctness path: it materializes dense score/candidate tensors and is
+not a million-token performance implementation. GPU tests and the example report
 actual exercised configurations; architecture presence is not evidence of
 released-scale convergence.
 
-Packed sequences, pipeline/virtual pipeline parallelism, context/tensor parallel
-attention, stack activation recomputation and CUDA graphs are rejected. Weight
+Pipeline/virtual pipeline parallelism, tensor-parallel attention, CUDA graphs, and
+the indexer KL loss under full recompute (the replay path restores the shared
+indexer state but does not track the loss) are rejected. Weight
 FP8/FP4 QAT is rejected. Optimized serving KV caches, bounded SWA replay, online
 speculative verification, the report's custom Sinkhorn-balanced optimizer, and
 HF quantized-weight import are outside this training implementation. Ordinary
@@ -161,6 +165,13 @@ NVIDIA_TF32_OVERRIDE=0 uv run python -m torch.distributed.run \
 
 uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
   -m pytest --experimental -q tests/unit_tests/models/test_engram_distributed_embedding.py
+
+# The CP tests in test_csa2.py (forward/gradient parity and the indexer-loss
+# match) skip at nproc-per-node=1 and need the 2-process launcher:
+uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  -m pytest --experimental -q \
+  tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py \
+  -k "thd_cp"
 ```
 
 The strict FP32 attention oracle uses an IEEE projection backend and disables

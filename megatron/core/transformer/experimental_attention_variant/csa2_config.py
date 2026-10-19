@@ -15,8 +15,6 @@ def validate_csa2_config(config) -> None:
         raise ValueError("CSA2 requires ordinary RMSNorm weights")
     if config.tensor_model_parallel_size != 1:
         raise NotImplementedError("CSA2 currently requires TP=1")
-    if config.context_parallel_size > 1 and (config.dsa_indexer_loss_coeff or 0) > 0:
-        raise NotImplementedError("CSA2 CP indexer loss is not yet supported")
     if config.fp16 or config.params_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError("CSA2 supports FP32 or BF16 parameters")
     if config.dsa_kernel_backend not in ("none", "cudnn"):

@@ -55,6 +55,13 @@ from .csa_utils.csa2_context_parallel import (
     build_csa2_cp_compression_layout,
 )
 
+# Rows per select_indices argsort chunk, as a score-matrix element budget: the CUDA
+# stable-sort workspace scales with rows*keys (measured ~9.5 GiB on top of the
+# 1.19 GiB score matrix at 19456x16384 fp32), which OOMs long-context CP
+# micro-batches whose activations otherwise fit. Rows sort independently, so
+# chunking keeps the semantics bit-identical while bounding the workspace.
+_SELECT_ROW_CHUNK_ELEMENTS = 1 << 24
+
 
 def _chunked_csa2_indexer_scores(
     q: torch.Tensor, indexer_k: torch.Tensor, weights: torch.Tensor, key_chunk_size: int = 64
@@ -453,11 +460,28 @@ class CSA2Indexer(MegatronModule):
 
     def select_indices(self, scores: torch.Tensor) -> torch.Tensor:
         """Return sorted logical positions, with -1 for masked or unavailable entries."""
-        # ReLU scores can tie at zero; masked future capacity must not change the winners.
-        indices = scores.argsort(dim=-1, descending=True, stable=True)[
-            ..., : min(self.topk, scores.shape[-1])
-        ]
-        indices = indices.sort(dim=-1).values
+        # Stable descending selection is the contract: among tied scores (ReLU emits
+        # exact zeros) the lowest index wins, independent of the packed width --
+        # masked future capacity must not change the winners. One full-matrix
+        # argsort OOMs long-context CP micro-batches (see
+        # _SELECT_ROW_CHUNK_ELEMENTS), but each row sorts independently, so sort in
+        # row chunks instead: identical semantics with a bounded workspace.
+        topk = min(self.topk, scores.shape[-1])
+        # Zero key columns (a packed batch with no complete compression group) or
+        # zero rows keep the pre-chunking contract: an empty int32 selection,
+        # which reshape/cat below cannot express.
+        if topk == 0 or scores.numel() == 0:
+            return torch.empty(
+                *scores.shape[:-1], topk, dtype=torch.int32, device=scores.device
+            )
+        flat = scores.reshape(-1, scores.shape[-1])
+        chunk = max(1, _SELECT_ROW_CHUNK_ELEMENTS // max(flat.shape[-1], 1))
+        parts = []
+        for start in range(0, flat.shape[0], chunk):
+            block = flat[start : start + chunk]
+            winners = block.argsort(dim=-1, descending=True, stable=True)[..., :topk]
+            parts.append(winners.sort(dim=-1).values)
+        indices = torch.cat(parts, dim=0).reshape(*scores.shape[:-1], topk)
         return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
 
     @torch.no_grad()
@@ -773,8 +797,6 @@ class CompressedSparseAttention2(MegatronModule):
             raise ValueError("CSA2 CP requires THD metadata and both left boundaries")
         if cp_size == 1 and (boundary_hidden is not None or boundary_kv is not None):
             raise ValueError("CSA2 boundary tensors require CP > 1")
-        if cp_size > 1 and (self.config.dsa_indexer_loss_coeff or 0) > 0:
-            raise NotImplementedError("CSA2 CP indexer loss is not yet supported")
         thd_layout = None
         if packed_seq_params is not None:
             thd_layout = build_csa2_thd_layout(
@@ -881,6 +903,18 @@ class CompressedSparseAttention2(MegatronModule):
                 loss=logged_loss,
                 layer_number=self.layer_idx + 1,
                 num_layers=len(self.config.csa_compress_ratios),
+                # Under CP every rank only holds its own shard's token rows, so the
+                # logged token mean is a shard mean; pass the CP group so the
+                # tracker flush averages the shards into the global mean. AVG is
+                # correct in both reduction modes (the DSA line SUMs in per-token
+                # mode because its saved value is a raw token sum) since the value
+                # saved here is already a token mean in either mode, and the
+                # contiguous THD CP layout gives every shard the same padded row
+                # count, so averaging the shard means reproduces the unsplit mean
+                # exactly. Parameter gradients need no group: finalize_model_grads
+                # reduces them over dp_cp (AVG in mean mode, token-count-scaled in
+                # per-token mode).
+                avg_group=self.cp_group if cp_size > 1 else None,
             )
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
         csa2_state.last_layer = self.layer_idx
