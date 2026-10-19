@@ -51,6 +51,33 @@ class CSA2CandidateBlocks:
 
 
 @torch.no_grad()
+def candidate_blocks_from_block_scores(
+    block_scores: Tensor, visible: Tensor | int, topk_blocks: int, block_size: int
+) -> CSA2CandidateBlocks:
+    """Rank precomputed causal block maxima (the tail of candidate_blocks_from_scores).
+
+    ``block_scores`` is already each row's per-block amax over its sequence-local
+    key blocks; ``visible`` broadcasts against block rows with a trailing
+    singleton dimension. Earlier block IDs win equal scores and the newest
+    visible block is forced, exactly as in candidate_blocks_from_scores.
+    """
+    if topk_blocks <= 0 or block_size <= 0:
+        raise ValueError("CSA2 candidate block count and size must be positive")
+    num_blocks = block_scores.shape[-1]
+    newest = (visible - 1) // block_size
+    block_scores = block_scores.masked_fill(
+        torch.arange(num_blocks, device=block_scores.device) == newest, torch.inf
+    )
+    ids = block_scores.argsort(dim=-1, descending=True, stable=True)[
+        ..., : min(topk_blocks, num_blocks)
+    ]
+    valid = block_scores.gather(-1, ids) > -torch.inf
+    sentinel = torch.iinfo(torch.int32).max
+    ids = ids.masked_fill(~valid, sentinel).sort(-1).values
+    return CSA2CandidateBlocks(ids.masked_fill(ids == sentinel, -1).int(), block_size)
+
+
+@torch.no_grad()
 def candidate_blocks_from_scores(
     scores: Tensor, visible: Tensor | int, topk_blocks: int, block_size: int
 ) -> CSA2CandidateBlocks:
@@ -64,14 +91,4 @@ def candidate_blocks_from_scores(
     padded = F.pad(scores, (0, -scores.shape[-1] % block_size), value=-torch.inf)
     num_blocks = padded.shape[-1] // block_size
     block_scores = padded.unflatten(-1, (num_blocks, block_size)).amax(-1)
-    newest = (visible - 1) // block_size
-    block_scores = block_scores.masked_fill(
-        torch.arange(num_blocks, device=scores.device) == newest, torch.inf
-    )
-    ids = block_scores.argsort(dim=-1, descending=True, stable=True)[
-        ..., : min(topk_blocks, num_blocks)
-    ]
-    valid = block_scores.gather(-1, ids) > -torch.inf
-    sentinel = torch.iinfo(torch.int32).max
-    ids = ids.masked_fill(~valid, sentinel).sort(-1).values
-    return CSA2CandidateBlocks(ids.masked_fill(ids == sentinel, -1).int(), block_size)
+    return candidate_blocks_from_block_scores(block_scores, visible, topk_blocks, block_size)

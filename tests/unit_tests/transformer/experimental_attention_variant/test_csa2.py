@@ -38,6 +38,7 @@ from megatron.core.transformer.experimental_attention_variant.csa2_module_spec i
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
     CSA2CandidateBlocks,
+    candidate_blocks_from_block_scores,
     candidate_blocks_from_scores,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_context_parallel import (
@@ -1247,6 +1248,62 @@ def test_candidate_blocks_exclude_old_blocks_and_force_newest():
     selected = select_candidate_blocks(partial, torch.tensor([[3]], device="cuda"), 2, 2)
     expected = torch.tensor([[[True, True, True, True, False, False, False]]], device="cuda")
     torch.testing.assert_close(selected, expected)
+
+
+def test_chunked_candidate_block_scores_match_full_gather(monkeypatch):
+    """The chunked sequence-local reduction is bit-identical to the full gather.
+
+    Covers ragged block tails, sequence boundaries inside shards, multi-chunk
+    splits via a tiny element budget, and the all-masked (-inf) path that the
+    candidate-source layer takes when a row's sequence has no visible keys.
+    """
+    import dataclasses
+
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    @dataclasses.dataclass
+    class _Compressed:
+        cu_seqlens_padded: torch.Tensor
+        max_seqlen: int
+
+    torch.manual_seed(93)
+    rows, keys, nseq, block_size = 50, 300, 3, 8
+    # Padded per-sequence capacities are not block multiples, so the -inf
+    # block tail and the OOB mask vary per sequence.
+    capacities = torch.tensor([104, 136, 56], device="cuda", dtype=torch.int64)
+    cu = torch.zeros(nseq + 1, device="cuda", dtype=torch.int64)
+    cu[1:] = capacities.cumsum(0)
+    max_seqlen = int(capacities.max())
+    sequence_ids = torch.randint(0, nseq, (rows,), device="cuda")
+    scores = torch.randn(rows, keys, device="cuda", dtype=torch.float32)
+    # One row's sequence entirely OOB so its blocks come out all -inf.
+    scores[0] = -torch.inf
+
+    local_keys = torch.arange(max_seqlen, device="cuda")
+    physical = cu[sequence_ids, None] + local_keys
+    full_local = scores.gather(1, physical.clamp_max(keys - 1).long())
+    full_local = full_local.masked_fill(physical >= cu[sequence_ids + 1, None], -torch.inf)
+    padded = F.pad(full_local, (0, -max_seqlen % block_size), value=-torch.inf)
+    num_blocks = padded.shape[-1] // block_size
+    expected = padded.unflatten(-1, (num_blocks, block_size)).amax(-1)
+
+    # Force several chunks (and chunk-boundary rows) with a tiny budget.
+    monkeypatch.setattr(csa2_module, "_SELECT_ROW_CHUNK_ELEMENTS", 3 * max_seqlen)
+    chunked = csa2_module._chunked_candidate_block_scores(
+        scores, sequence_ids, _Compressed(cu, max_seqlen), block_size
+    )
+    assert chunked.shape == expected.shape
+    torch.testing.assert_close(chunked, expected, rtol=0, atol=0)
+
+    # The reduced form feeds the same ranking as the full-matrix path.
+    visible = torch.randint(1, max_seqlen + 1, (1, rows, 1), device="cuda")
+    from_blocks = candidate_blocks_from_block_scores(
+        chunked.unsqueeze(0), visible, 2, block_size
+    )
+    from_full = candidate_blocks_from_scores(
+        full_local.unsqueeze(0), visible, 2, block_size
+    )
+    torch.testing.assert_close(from_blocks.indices, from_full.indices)
 
 
 @pytest.mark.parametrize("width", [0, 1, 3, 17, 1025])

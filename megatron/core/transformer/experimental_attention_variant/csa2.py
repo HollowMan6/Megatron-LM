@@ -11,6 +11,7 @@ from copy import copy
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
@@ -32,6 +33,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import (
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
     CSA2CandidateBlocks,
+    candidate_blocks_from_block_scores,
     candidate_blocks_from_scores,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
@@ -78,6 +80,48 @@ def _chunked_csa2_indexer_scores(
         chunk = torch.einsum("sbhd,tbd->bsht", q, indexer_k[start:end]).relu()
         scores[..., start:end] = (chunk * head_weights).sum(dim=2)
     return scores
+
+
+def _chunked_candidate_block_scores(
+    row_scores: torch.Tensor,
+    sequence_ids: torch.Tensor,
+    compressed,
+    block_size: int,
+    chunk_elements: int | None = None,
+) -> torch.Tensor:
+    """Sequence-local causal block maxima without the full local-score matrix.
+
+    ``row_scores`` is ``[rows, global_compressed_keys]`` fp32; the caller's
+    non-chunked form gathers each row's sequence-local interval into a second
+    ``[rows, max_seqlen]`` matrix before reducing blocks, which materializes a
+    second full-width tensor beside the global score matrix and OOMs
+    long-context micro-batches whose activations otherwise fit. Rows reduce
+    independently, so gather + mask + per-block amax run in row chunks with
+    identical results: the block amax of the same padded local values.
+    """
+    if chunk_elements is None:
+        chunk_elements = _SELECT_ROW_CHUNK_ELEMENTS
+    local_keys = torch.arange(compressed.max_seqlen, device=row_scores.device)
+    num_blocks = -(-local_keys.shape[0] // block_size)
+    block_scores = row_scores.new_empty((row_scores.shape[0], num_blocks))
+    pad_to = num_blocks * block_size - local_keys.shape[0]
+    chunk = max(1, chunk_elements // max(local_keys.shape[0], 1))
+    for start in range(0, row_scores.shape[0], chunk):
+        end = min(start + chunk, row_scores.shape[0])
+        seq = sequence_ids[start:end]
+        physical = compressed.cu_seqlens_padded[seq, None] + local_keys
+        gathered = row_scores[start:end].gather(
+            1, physical.clamp_max(row_scores.shape[-1] - 1).long()
+        )
+        gathered = gathered.masked_fill(
+            physical >= compressed.cu_seqlens_padded[seq + 1, None], -torch.inf
+        )
+        if pad_to:
+            gathered = F.pad(gathered, (0, pad_to), value=-torch.inf)
+        block_scores[start:end] = gathered.unflatten(
+            -1, (num_blocks, block_size)
+        ).amax(-1)
+    return block_scores
 
 
 @dataclass
@@ -697,30 +741,41 @@ class CompressedSparseAttention2(MegatronModule):
                         visible = (
                             torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
                         ).unsqueeze(-1)
+                        state.candidates = candidate_blocks_from_scores(
+                            scores,
+                            visible,
+                            self.config.csa2_candidate_topk_blocks,
+                            self.config.csa2_candidate_block_size,
+                        )
                     else:
                         sequence_ids = thd_layout.sequence_ids.clamp_min(0)
                         compressed = state.compressed_layout
-                        local_keys = torch.arange(compressed.max_seqlen, device=x.device)
-                        physical = compressed.cu_seqlens_padded[sequence_ids, None] + local_keys
                         if scores.shape[-1]:
-                            local_scores = scores.squeeze(0).gather(
-                                1, physical.clamp_max(scores.shape[-1] - 1).long()
-                            )
-                            local_scores = local_scores.masked_fill(
-                                physical >= compressed.cu_seqlens_padded[sequence_ids + 1, None],
-                                -torch.inf,
+                            # Reduce to per-block maxima in row chunks (see
+                            # _chunked_candidate_block_scores): the sequence-
+                            # local gather would materialize a second full-width
+                            # matrix beside the global score matrix.
+                            block_scores = _chunked_candidate_block_scores(
+                                scores.squeeze(0),
+                                sequence_ids,
+                                compressed,
+                                self.config.csa2_candidate_block_size,
                             )
                         else:
-                            local_scores = scores.new_full(physical.shape, -torch.inf)
+                            num_blocks = -(
+                                -compressed.max_seqlen
+                                // self.config.csa2_candidate_block_size
+                            )
+                            block_scores = scores.new_full(
+                                (sequence_ids.shape[0], num_blocks), -torch.inf
+                            )
                         visible = (thd_layout.position_ids + 1) // self.compress_ratio
-                        local_scores = local_scores.unsqueeze(0)
-                        visible = visible.unsqueeze(0).unsqueeze(-1)
-                    state.candidates = candidate_blocks_from_scores(
-                        scores if thd_layout is None else local_scores,
-                        visible,
-                        self.config.csa2_candidate_topk_blocks,
-                        self.config.csa2_candidate_block_size,
-                    )
+                        state.candidates = candidate_blocks_from_block_scores(
+                            block_scores.unsqueeze(0),
+                            visible.unsqueeze(0).unsqueeze(-1),
+                            self.config.csa2_candidate_topk_blocks,
+                            self.config.csa2_candidate_block_size,
+                        )
                     state.candidate_source_layer = self.layer_idx
                 # The candidate source itself selects over all causal positions. Only later
                 # Reindex layers apply its candidate mask, matching the reference ordering.
