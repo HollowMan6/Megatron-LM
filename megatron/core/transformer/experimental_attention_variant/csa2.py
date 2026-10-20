@@ -74,6 +74,10 @@ _SELECT_ROW_CHUNK_ELEMENTS = 1 << 24
 # (tie-breaking is unaffected: merged keys are still index-ascending).
 _SELECT_MERGE_STAGE_KEYS = 4096
 
+# Debug cross-check: compute the fused and dense selections, compare, use dense.
+_FUSED_CHECK = os.environ.get("CSA2_FUSED_CHECK", "0") == "1"
+_check_reported: set = set()
+
 
 def _chunked_csa2_indexer_scores(
     q: torch.Tensor, indexer_k: torch.Tensor, weights: torch.Tensor, key_chunk_size: int = 64
@@ -1088,6 +1092,46 @@ class CompressedSparseAttention2(MegatronModule):
                     want_block_scores=self.is_candidate_source,
                     candidate_block_size=self.config.csa2_candidate_block_size,
                 )
+            if _FUSED_CHECK and fused is not None:
+                # Cross-check against the select a non-fused run would take: the
+                # same grad mode as the dense branch below (the fused gate above
+                # implies no indexer loss), so both sides read the same chunked
+                # score path and the check's own score matrix stays bounded.
+                with torch.set_grad_enabled(use_indexer_loss):
+                    _dense_scores = self.indexer.forward_before_topk(
+                        x.detach(),
+                        qr.detach(),
+                        None,
+                        self.rotary_pos_emb,
+                        indexer_k=state.indexer_k,
+                        candidates=candidates,
+                        thd_layout=thd_layout,
+                        compressed_layout=state.compressed_layout,
+                    )
+                with torch.no_grad():
+                    _dense_idx = self.indexer.select_indices(_dense_scores)
+                    _f_idx = fused[0]
+                    _eq = bool(torch.equal(_f_idx, _dense_idx))
+                    if not _eq:
+                        _mismatch = _f_idx != _dense_idx
+                        _bad = _mismatch.any(dim=-1).nonzero().flatten()[:5].tolist()
+                        _rows = _f_idx.shape[-2]
+                        print(
+                            f"[FUSED-CHECK] layer={self.layer_idx} MISMATCH rows={_bad} "
+                            f"of {_rows} n_bad={_mismatch.any(dim=-1).sum().item()} "
+                            f"fused_valid={int((_f_idx >= 0).sum())} "
+                            f"dense_valid={int((_dense_idx >= 0).sum())}",
+                            flush=True,
+                        )
+                    elif f"L{self.layer_idx}" not in _check_reported:
+                        _check_reported.add(f"L{self.layer_idx}")
+                        print(
+                            f"[FUSED-CHECK] layer={self.layer_idx} EQUAL "
+                            f"valid={int((_f_idx >= 0).sum())}/{_f_idx.numel()}",
+                            flush=True,
+                        )
+                # Keep the run on the dense (known-good) result.
+                fused = (_dense_idx, fused[1])
             if fused is None:
                 with torch.set_grad_enabled(use_indexer_loss):
                     scores = self.indexer.forward_before_topk(
