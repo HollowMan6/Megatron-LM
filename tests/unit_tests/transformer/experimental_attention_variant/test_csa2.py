@@ -1524,6 +1524,18 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     ).int()
     torch.testing.assert_close(dead_tail_got, dead_tail_ref, rtol=0, atol=0)
 
+    # (4) Every tile dead: an all -1 candidate set leaves no live 64-key tile,
+    #     so the live-tile walk yields no bounds and no stage ever scores a
+    #     key. The select must still materialize the empty selection (all -1,
+    #     shape [b, s, k]) instead of raising on an unmaterialized run.
+    none_ids = torch.full((1, s, 2), -1, dtype=torch.int32, device="cuda")
+    none_cand = CSA2CandidateBlocks(none_ids, block_size)
+    none_got, _ = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, none_cand, False, block_size
+    )
+    assert none_got.shape == (1, s, k) and none_got.dtype == torch.int32
+    assert (none_got == -1).all()
+
 
 @pytest.mark.parametrize("width", [0, 1, 3, 17, 1025])
 def test_compact_candidates_match_dense_mask_and_bound_retained_storage(width):

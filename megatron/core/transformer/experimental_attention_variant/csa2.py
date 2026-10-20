@@ -299,6 +299,11 @@ def _streaming_indexer_topk(
                 )
             )
             i = j + 1
+        if not stage_bounds:
+            # Every tile is dead (fully padded pack or an all -1 candidate
+            # set): no key can ever be selected, so run one empty stage to
+            # materialize the all -1 result instead of leaving run_idx None.
+            stage_bounds = [(0, 0)]
     elif causal_key_limit < keys:
         stage_bounds = [(0, causal_key_limit)]
     for bounds in (stage_bounds if stage_bounds is not None else [(0, keys)]):
@@ -365,7 +370,13 @@ def _streaming_indexer_topk(
             order = sel_idx.argsort(dim=-1, stable=True)  # keep index-ascending
             run_score = sel_score.gather(-1, order)
             run_idx = sel_idx.gather(-1, order)
-    indices = run_idx.masked_fill(~run_score.isfinite(), -1).int()
+    if run_idx is None:
+        # No stage scored a key (every tile was dead, or the causal limit is
+        # zero): nothing can be selected, so emit the all -1 selection the
+        # masked dense select would produce.
+        indices = torch.full((b, s, k), -1, dtype=torch.int32, device=q.device)
+    else:
+        indices = run_idx.masked_fill(~run_score.isfinite(), -1).int()
     block_scores = None
     if block_table is not None:
         n_slots = block_table.shape[1] // n_local_blocks
