@@ -1403,8 +1403,12 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     ref_c = winners_c[..., :k].sort(dim=-1).values.reshape(1, s, k)
     ref_c = ref_c.masked_fill(~scores_c.gather(-1, ref_c).isfinite(), -1).int()
 
-    # Fused: multi-chunk via a tiny budget.
+    # Fused: multi-chunk via a tiny budget. The merge stage is driven by
+    # _SELECT_MERGE_STAGE_KEYS, not by the budget, so shrink it too: this
+    # fixture holds 104 keys (causal limit 101), where 64 is the only
+    # multiple of the 64-key einsum tiling that leaves more than one merge.
     monkeypatch.setattr(csa2_module, "_SELECT_ROW_CHUNK_ELEMENTS", 256)
+    monkeypatch.setattr(csa2_module, "_SELECT_MERGE_STAGE_KEYS", 64)
     got_indices, got_blocks = csa2_module._streaming_indexer_topk(
         q, indexer_k, weights, topk, ratio, thd, comp, None, True, block_size
     )
@@ -1492,6 +1496,33 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
         ~sparse_scores.gather(-1, sparse_winners).isfinite(), -1
     ).int()
     torch.testing.assert_close(dense_skip_got, sparse_ref, rtol=0, atol=0)
+
+    # (3) Dead trailing tile: the live-tile run-length walk must iterate the
+    #     LIVE count, not the tile count. Only sequence 0 (keys 0..47) keeps a
+    #     candidate block here, so the second 64-key tile (keys 64..103) has no
+    #     candidate key for any row -- exactly the shape the causal skip
+    #     produces in production, and the one that indexes tile_ids past its
+    #     end if the walk is bounded by the tile count.
+    dead_tail_ids = torch.full((1, s, 2), -1, dtype=torch.int32, device="cuda")
+    dead_tail_ids[0, : row_counts[0], 0] = 0  # only block 0 -> keys 0..7, seq 0
+    dead_tail_cand = CSA2CandidateBlocks(dead_tail_ids, block_size)
+    dead_tail_got, _ = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, dead_tail_cand, False, block_size
+    )
+    dead_tail_mask = dead_tail_cand.to_mask_thd(
+        thd.sequence_ids, comp.sequence_ids, comp.position_ids // ratio
+    )
+    dead_tail_scores = scores.masked_fill(~dead_tail_mask, -torch.inf)
+    dead_tail_winners = (
+        dead_tail_scores.reshape(-1, dead_tail_scores.shape[-1])
+        .argsort(dim=-1, descending=True, stable=True)[..., :k]
+        .sort(dim=-1)
+        .values.reshape(1, s, k)
+    )
+    dead_tail_ref = dead_tail_winners.masked_fill(
+        ~dead_tail_scores.gather(-1, dead_tail_winners).isfinite(), -1
+    ).int()
+    torch.testing.assert_close(dead_tail_got, dead_tail_ref, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("width", [0, 1, 3, 17, 1025])

@@ -66,6 +66,14 @@ from .csa_utils.csa2_context_parallel import (
 # chunking keeps the semantics bit-identical while bounding the workspace.
 _SELECT_ROW_CHUNK_ELEMENTS = 1 << 24
 
+# Keys buffered per top-k merge. The inner einsum MUST stay at the dense
+# path's 64-key tiling (fp32 accumulation order), but merging every 64 keys
+# re-sorts the running set thousands of times: at 256K context that made the
+# select sort ~9x the dense element count and dominated the step. Buffering
+# 4096 keys per merge cuts merge calls 64x and the extra sort work to ~12%
+# (tie-breaking is unaffected: merged keys are still index-ascending).
+_SELECT_MERGE_STAGE_KEYS = 4096
+
 
 def _chunked_csa2_indexer_scores(
     q: torch.Tensor, indexer_k: torch.Tensor, weights: torch.Tensor, key_chunk_size: int = 64
@@ -244,8 +252,8 @@ def _streaming_indexer_topk(
     # bit-for-bit (a different GEMM tiling changes fp32 accumulation order
     # and the tie/amax outcomes); the outer stage only batches merges.
     dense_key_chunk = 64
-    stage = key_chunk - (key_chunk % dense_key_chunk)
-    stage = max(dense_key_chunk, stage)
+    stage = max(dense_key_chunk, _SELECT_MERGE_STAGE_KEYS)
+    stage -= stage % dense_key_chunk
     # Two orthogonal key-skip levels. Skipped keys are exactly the ones the
     # dense path would mask to -inf (never winners), so the selection stays
     # bit-identical while the scorer skips their GEMM work entirely.
@@ -274,11 +282,15 @@ def _streaming_indexer_topk(
         live_padded = F.pad(live_mask, (0, pad), value=False)
         tile_liveness = live_padded.view(-1, dense_key_chunk).any(dim=-1)
         tile_ids = tile_liveness.nonzero().flatten()
+        # `tile_ids` holds one entry per LIVE tile, which is fewer than
+        # `n_tiles` whenever any tile is dead -- the normal case, since the
+        # causal skip alone kills the padding tail. Iterate its own length.
+        n_live = tile_ids.numel()
         stage_bounds = []
         i = 0
-        while i < n_tiles:
+        while i < n_live:
             j = i
-            while j + 1 < n_tiles and int(tile_ids[j + 1]) == int(tile_ids[j]) + 1:
+            while j + 1 < n_live and int(tile_ids[j + 1]) == int(tile_ids[j]) + 1:
                 j += 1
             stage_bounds.append(
                 (
