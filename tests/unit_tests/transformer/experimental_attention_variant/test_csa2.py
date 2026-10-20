@@ -1417,6 +1417,82 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     torch.testing.assert_close(got_c, ref_c, rtol=0, atol=0)
     assert (got_indices[0, -5:] == -1).all()  # sentinel rows survive the streaming merge
 
+    # ---- Key-skip dimensions (same bit-identity contract) ----
+    # (1) Causal skip: a single-sequence layout with trailing padding groups
+    #     must produce identical outputs while skipping the dead tail keys.
+    solo_rows = 96
+    solo_capacity = 48
+    solo_thd = _Thd(
+        torch.ones(solo_rows, dtype=torch.bool, device="cuda"),
+        torch.zeros(solo_rows, dtype=torch.int64, device="cuda"),
+        torch.arange(solo_rows, dtype=torch.int64, device="cuda"),
+    )
+    solo_cu = torch.tensor([0, solo_capacity], dtype=torch.int64, device="cuda")
+    solo_key_seq = torch.zeros(solo_capacity, dtype=torch.int64, device="cuda")
+    solo_key_pos = torch.arange(solo_capacity, dtype=torch.int64, device="cuda") * ratio
+    # trailing invalid groups: the last 5 groups are padding
+    solo_valid_groups = torch.ones(solo_capacity, dtype=torch.bool, device="cuda")
+    solo_valid_groups[-5:] = False
+    solo_comp = _Compressed(
+        solo_cu, solo_capacity, solo_valid_groups, solo_key_seq, solo_key_pos
+    )
+    solo_scores = csa2_module._chunked_csa2_indexer_scores(q[:solo_rows], indexer_k[:solo_capacity], weights[:solo_rows])
+    solo_causal = (
+        solo_thd.valid_tokens[:, None]
+        & solo_comp.valid_groups[None, :]
+        & (solo_thd.sequence_ids[:, None] == solo_comp.sequence_ids[None, :])
+        & (solo_comp.position_ids[None, :] + ratio <= solo_thd.position_ids[:, None] + 1)
+    )
+    solo_scores = solo_scores.masked_fill(~solo_causal, -torch.inf)
+    solo_winners = (
+        solo_scores.reshape(-1, solo_scores.shape[-1])
+        .argsort(dim=-1, descending=True, stable=True)[..., :k]
+        .sort(dim=-1)
+        .values.reshape(1, solo_rows, k)
+    )
+    solo_ref = solo_winners.masked_fill(
+        ~solo_scores.gather(-1, solo_winners).isfinite(), -1
+    ).int()
+    solo_got, _ = csa2_module._streaming_indexer_topk(
+        q[:solo_rows],
+        indexer_k[:solo_capacity],
+        weights[:solo_rows],
+        topk,
+        ratio,
+        solo_thd,
+        solo_comp,
+        None,
+        False,
+        block_size,
+    )
+    torch.testing.assert_close(solo_got, solo_ref, rtol=0, atol=0)
+
+    # (2) Candidate skip: keys outside every row's candidate tiles are dead;
+    #     the skip form must match the already-verified candidate select.
+    # Give rows disjoint candidate blocks so live tiles are sparse and
+    # interleaved (some 64-key tiles fully dead, some live).
+    sparse_ids = torch.randint(0, 4, (1, s, 2), dtype=torch.int32, device="cuda")
+    sparse_ids[0, -5:] = -1
+    sparse_cand = CSA2CandidateBlocks(sparse_ids, block_size)
+    dense_skip_got, _ = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, sparse_cand, False, block_size
+    )
+    # dense-path reference for the sparse candidate set
+    sparse_mask = sparse_cand.to_mask_thd(
+        thd.sequence_ids, comp.sequence_ids, comp.position_ids // ratio
+    )
+    sparse_scores = scores.masked_fill(~sparse_mask, -torch.inf)
+    sparse_winners = (
+        sparse_scores.reshape(-1, sparse_scores.shape[-1])
+        .argsort(dim=-1, descending=True, stable=True)[..., :k]
+        .sort(dim=-1)
+        .values.reshape(1, s, k)
+    )
+    sparse_ref = sparse_winners.masked_fill(
+        ~sparse_scores.gather(-1, sparse_winners).isfinite(), -1
+    ).int()
+    torch.testing.assert_close(dense_skip_got, sparse_ref, rtol=0, atol=0)
+
 
 @pytest.mark.parametrize("width", [0, 1, 3, 17, 1025])
 def test_compact_candidates_match_dense_mask_and_bound_retained_storage(width):

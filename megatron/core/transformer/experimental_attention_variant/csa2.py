@@ -246,68 +246,113 @@ def _streaming_indexer_topk(
     dense_key_chunk = 64
     stage = key_chunk - (key_chunk % dense_key_chunk)
     stage = max(dense_key_chunk, stage)
-    for stage_start in range(0, keys, stage):
-        stage_end = min(stage_start + stage, keys)
-        width = stage_end - stage_start
-        chunk = torch.empty(b, s, width, device=q.device, dtype=torch.float32)
-        for start in range(stage_start, stage_end, dense_key_chunk):
-            end = min(start + dense_key_chunk, stage_end)
-            c = torch.einsum("sbhd,tbd->bsht", q, indexer_k[start:end]).relu()
-            chunk[..., start - stage_start : end - stage_start] = (c * head_weights).sum(dim=2)
-        keep = (
-            rows_valid[:, None]
-            & compressed_layout.valid_groups[None, stage_start:stage_end]
-            & (
-                rows_seq[:, None]
-                == compressed_layout.sequence_ids[None, stage_start:stage_end]
+    # Two orthogonal key-skip levels. Skipped keys are exactly the ones the
+    # dense path would mask to -inf (never winners), so the selection stays
+    # bit-identical while the scorer skips their GEMM work entirely.
+    # (1) Causal: a single-sequence pack whose trailing groups are padding
+    #     cannot show those keys to any row (the 4-term keep chain is False
+    #     for every row there); only safe for a monotone
+    #     [true...true, false...false] valid_groups (multi-sequence packs
+    #     can have interior unassigned slots between sequences).
+    causal_key_limit = keys
+    if thd_layout.valid_tokens.any() and int(thd_layout.sequence_ids.min()) >= 0:
+        vg = compressed_layout.valid_groups
+        first_false = (~vg).nonzero().flatten()
+        if first_false.numel():
+            limit = int(first_false[0])
+            if bool(vg[limit:].logical_not().all()):
+                causal_key_limit = limit
+    # (2) Candidate: with a candidate set, a 64-key tile with no candidate
+    #     key for any row is dead for every row. Only live tiles are staged.
+    stage_bounds = None
+    if member is not None and slot_of_key is not None:
+        any_member = member.any(dim=0)  # [n_slots * n_local_blocks]
+        live_keys = any_member[slot_of_key]  # [keys]
+        n_tiles = -(-keys // dense_key_chunk)
+        pad = n_tiles * dense_key_chunk - keys
+        live_mask = (torch.arange(keys, device=q.device) < causal_key_limit) & live_keys
+        live_padded = F.pad(live_mask, (0, pad), value=False)
+        tile_liveness = live_padded.view(-1, dense_key_chunk).any(dim=-1)
+        tile_ids = tile_liveness.nonzero().flatten()
+        stage_bounds = []
+        i = 0
+        while i < n_tiles:
+            j = i
+            while j + 1 < n_tiles and int(tile_ids[j + 1]) == int(tile_ids[j]) + 1:
+                j += 1
+            stage_bounds.append(
+                (
+                    int(tile_ids[i]) * dense_key_chunk,
+                    min(keys, (int(tile_ids[j]) + 1) * dense_key_chunk),
+                )
             )
-            & (
-                compressed_layout.position_ids[None, stage_start:stage_end] + compress_ratio
-                <= rows_pos[:, None] + 1
+            i = j + 1
+    elif causal_key_limit < keys:
+        stage_bounds = [(0, causal_key_limit)]
+    for bounds in (stage_bounds if stage_bounds is not None else [(0, keys)]):
+        stage_lo0, stage_stop = bounds
+        for stage_start in range(stage_lo0, stage_stop, stage):
+            stage_end = min(stage_start + stage, stage_stop)
+            width = stage_end - stage_start
+            chunk = torch.empty(b, s, width, device=q.device, dtype=torch.float32)
+            for start in range(stage_start, stage_end, dense_key_chunk):
+                end = min(start + dense_key_chunk, stage_end)
+                c = torch.einsum("sbhd,tbd->bsht", q, indexer_k[start:end]).relu()
+                chunk[..., start - stage_start : end - stage_start] = (c * head_weights).sum(dim=2)
+            keep = (
+                rows_valid[:, None]
+                & compressed_layout.valid_groups[None, stage_start:stage_end]
+                & (
+                    rows_seq[:, None]
+                    == compressed_layout.sequence_ids[None, stage_start:stage_end]
+                )
+                & (
+                    compressed_layout.position_ids[None, stage_start:stage_end] + compress_ratio
+                    <= rows_pos[:, None] + 1
+                )
             )
-        )
-        if member is not None:
-            if slot_of_key is not None:
-                member_of_chunk = member[:, slot_of_key[stage_start:stage_end]]
+            if member is not None:
+                if slot_of_key is not None:
+                    member_of_chunk = member[:, slot_of_key[stage_start:stage_end]]
+                else:
+                    member_of_chunk = member[
+                        :,
+                        torch.div(
+                            torch.arange(stage_start, stage_end, device=q.device),
+                            candidate_block_size,
+                            rounding_mode="floor",
+                        ),
+                    ]
+            elif isinstance(candidates, torch.Tensor):
+                member_of_chunk = candidates[..., stage_start:stage_end]
             else:
-                member_of_chunk = member[
-                    :,
-                    torch.div(
-                        torch.arange(stage_start, stage_end, device=q.device),
-                        candidate_block_size,
-                        rounding_mode="floor",
-                    ),
-                ]
-        elif isinstance(candidates, torch.Tensor):
-            member_of_chunk = candidates[..., stage_start:stage_end]
-        else:
-            member_of_chunk = None
-        if member_of_chunk is not None:
-            keep = keep & member_of_chunk
-        chunk = chunk.masked_fill(~keep, -torch.inf)
-        if block_table is not None:
-            block_table.scatter_reduce_(
-                1,
-                slot_of_key[None, stage_start:stage_end].expand(s, width),
-                chunk[0],
-                reduce="amax",
-                include_self=True,
-            )
-        ck_idx = stage_start + torch.arange(width, device=q.device).expand(b, s, width)
-        if run_idx is not None:
-            cat_score = torch.cat([run_score, chunk], dim=-1)
-            cat_idx = torch.cat([run_idx, ck_idx], dim=-1)
-        else:
-            cat_score, cat_idx = chunk, ck_idx
-        if cat_score.shape[-1] > k:
-            winners = cat_score.argsort(dim=-1, descending=True, stable=True)[..., :k]
-            sel_score = cat_score.gather(-1, winners)
-            sel_idx = cat_idx.gather(-1, winners)
-        else:
-            sel_score, sel_idx = cat_score, cat_idx
-        order = sel_idx.argsort(dim=-1, stable=True)  # keep index-ascending
-        run_score = sel_score.gather(-1, order)
-        run_idx = sel_idx.gather(-1, order)
+                member_of_chunk = None
+            if member_of_chunk is not None:
+                keep = keep & member_of_chunk
+            chunk = chunk.masked_fill(~keep, -torch.inf)
+            if block_table is not None:
+                block_table.scatter_reduce_(
+                    1,
+                    slot_of_key[None, stage_start:stage_end].expand(s, width),
+                    chunk[0],
+                    reduce="amax",
+                    include_self=True,
+                )
+            ck_idx = stage_start + torch.arange(width, device=q.device).expand(b, s, width)
+            if run_idx is not None:
+                cat_score = torch.cat([run_score, chunk], dim=-1)
+                cat_idx = torch.cat([run_idx, ck_idx], dim=-1)
+            else:
+                cat_score, cat_idx = chunk, ck_idx
+            if cat_score.shape[-1] > k:
+                winners = cat_score.argsort(dim=-1, descending=True, stable=True)[..., :k]
+                sel_score = cat_score.gather(-1, winners)
+                sel_idx = cat_idx.gather(-1, winners)
+            else:
+                sel_score, sel_idx = cat_score, cat_idx
+            order = sel_idx.argsort(dim=-1, stable=True)  # keep index-ascending
+            run_score = sel_score.gather(-1, order)
+            run_idx = sel_idx.gather(-1, order)
     indices = run_idx.masked_fill(~run_score.isfinite(), -1).int()
     block_scores = None
     if block_table is not None:
