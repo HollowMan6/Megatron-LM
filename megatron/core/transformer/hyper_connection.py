@@ -837,15 +837,26 @@ class HyperConnectionModule(MegatronModule):
         """Apply residual mixing and branch expansion once, preserving FP32 coefficients."""
         with torch.autocast(device_type=x.device.type, enabled=False):
             streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
-            if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
-                return (
-                    self._h_post_bda_op(
-                        h_res, streams, h_post, x.float(), None if bias is None else bias.float()
+            # Chunked-native fallback: the reference einsum materializes one
+            # [s, b, n, n, hidden] fp32 tensor per layer (~9 GiB at 10K tokens,
+            # held across layers); bmm over row chunks keeps one chunk alive and
+            # is mathematically identical (einsum("sbij,sbic->sbjc") = h_res^T @
+            # streams per row).
+            sb = streams.shape[0] * streams.shape[1]
+            h_res_2d = h_res.float().reshape(sb, self.n, self.n)
+            streams_2d = streams.reshape(sb, self.n, self.hidden_size)
+            row_chunk = max(1, (256 * 1024**2) // (self.n * self.hidden_size * 4))
+            mixed_rows = []
+            for start in range(0, sb, row_chunk):
+                end = min(start + row_chunk, sb)
+                mixed_rows.append(
+                    torch.bmm(
+                        h_res_2d[start:end].transpose(1, 2), streams_2d[start:end]
                     )
-                    .flatten(-2)
-                    .to(x.dtype)
                 )
-            mixed = torch.einsum("sbij,sbic->sbjc", h_res.float(), streams)
+            mixed = torch.cat(mixed_rows, dim=0).view(
+                streams.shape[0], streams.shape[1], self.n, self.hidden_size
+            )
             branch = x.float() if bias is None else x.float() + bias.float()
             expanded = h_post.float().unsqueeze(-1) * branch.unsqueeze(-2)
             expanded = F.dropout(expanded, p=dropout_prob, training=training)

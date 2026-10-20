@@ -46,8 +46,19 @@ class CSA2CandidateBlocks:
         invalid = (self.indices < 0) | (self.indices >= num_blocks)
         flags.scatter_(-1, self.indices.masked_fill(invalid, num_blocks).long(), True)
         key_blocks = key_local_positions.div(self.block_size, rounding_mode="floor").long()
-        selected = flags.gather(-1, key_blocks.expand(*self.indices.shape[:-1], num_keys))
-        return selected & (query_sequence_ids[None, :, None] == key_sequence_ids[None, None, :])
+        # Row-chunked gather: the single-shot gather materializes one
+        # [query, num_keys] bool matrix per call (~2.7 GiB at 9.5K packed rows x
+        # compressed keys); chunking keeps one slab alive, identical semantics.
+        n_rows = self.indices.shape[0] if self.indices.ndim >= 2 else 1
+        out = torch.empty(
+            (*self.indices.shape[:-1], num_keys), dtype=torch.bool, device=self.indices.device
+        )
+        row_chunk = max(1, (16 * 1024**2) // max(num_keys, 1))
+        for start in range(0, n_rows, row_chunk):
+            end = min(start + row_chunk, n_rows)
+            blocks = key_blocks.expand(*self.indices[start:end].shape[:-1], num_keys)
+            out[start:end] = flags[start:end].gather(-1, blocks)
+        return out & (query_sequence_ids[None, :, None] == key_sequence_ids[None, None, :])
 
 
 @torch.no_grad()

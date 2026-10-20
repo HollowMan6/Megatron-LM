@@ -124,6 +124,9 @@ def _chunked_candidate_block_scores(
     return block_scores
 
 
+_NEG_INF_SCORE = float("-inf")
+
+
 @dataclass
 class CSA2State:
     """Shared attention tensors for one full-sequence stack forward.
@@ -478,26 +481,64 @@ class CSA2Indexer(MegatronModule):
             visible = torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
             causal = torch.arange(indexer_k.shape[0], device=x.device)[None, :] < visible[:, None]
         else:
-            causal = (
-                thd_layout.valid_tokens[:, None]
-                & compressed_layout.valid_groups[None, :]
-                & (thd_layout.sequence_ids[:, None] == compressed_layout.sequence_ids[None, :])
-                & (
+            # One materialized [tokens, groups] buffer, accumulated in place: the
+            # chained `&` form materialized one full bool matrix per clause
+            # (~2.7 GiB each at 9.5K tokens x compressed groups), all alive at once.
+            # No [tokens, groups] mask is ever materialized: every causal clause
+            # is applied to a row-chunk score slab with torch.where. Each clause
+            # used to materialize one full bool matrix (~2.7 GiB at 9.5K tokens x
+            # compressed groups); the slab form is semantically identical.
+            n_seq = scores.shape[1]
+            row_chunk = max(1, (16 * 1024**2) // max(scores.shape[-1], 1))
+            for start in range(0, n_seq, row_chunk):
+                end = min(start + row_chunk, n_seq)
+                slab = scores[:, start:end]
+                visible = thd_layout.valid_tokens[start:end, None] & compressed_layout.valid_groups[None, :]
+                slab = torch.where(visible, slab, _NEG_INF_SCORE)
+                slab = torch.where(
+                    thd_layout.sequence_ids[start:end, None]
+                    == compressed_layout.sequence_ids[None, :],
+                    slab,
+                    _NEG_INF_SCORE,
+                )
+                slab = torch.where(
                     compressed_layout.position_ids[None, :] + self.compress_ratio
-                    <= thd_layout.position_ids[:, None] + 1
+                    <= thd_layout.position_ids[start:end, None] + 1,
+                    slab,
+                    _NEG_INF_SCORE,
                 )
-            )
-        scores = scores.masked_fill(~causal, -torch.inf)
+                scores[:, start:end].copy_(slab)
+        if isinstance(candidates, CSA2CandidateBlocks) and thd_layout is not None:
+            # Expand block IDs straight onto the score slab, row chunk by row
+            # chunk: to_mask_thd materialized one full [rows, num_keys] bool
+            # matrix (~2.7 GiB at 9.5K rows x compressed keys) while every
+            # consumer only needs the mask applied to its scores.
+            key_local_positions = compressed_layout.position_ids // self.compress_ratio
+            num_keys = key_local_positions.numel()
+            if candidates.indices.shape[-1] == 0 or num_keys == 0:
+                return scores
+            num_blocks = (num_keys + candidates.block_size - 1) // candidates.block_size
+            key_blocks = key_local_positions.div(candidates.block_size, rounding_mode="floor").long()
+            n_seq = scores.shape[1]
+            row_chunk = max(1, (16 * 1024**2) // max(num_keys, 1))
+            for start in range(0, n_seq, row_chunk):
+                end = min(start + row_chunk, n_seq)
+                ids = candidates.indices[:, start:end]  # [b, chunk, topk_blocks]
+                invalid = (ids < 0) | (ids >= num_blocks)
+                ids = ids.masked_fill(invalid, num_blocks)
+                flags = torch.zeros(
+                    (*ids.shape[:-1], num_blocks + 1), dtype=torch.bool, device=ids.device
+                )
+                flags.scatter_(-1, ids.long(), True)
+                sel = flags.gather(-1, key_blocks.expand(*ids.shape[:-1], num_keys))
+                sel = sel & (
+                    thd_layout.sequence_ids[start:end, None]
+                    == compressed_layout.sequence_ids[None, :]
+                )
+                scores[:, start:end] = scores[:, start:end].masked_fill(~sel, -torch.inf)
+            return scores
         if isinstance(candidates, CSA2CandidateBlocks):
-            candidates = (
-                candidates.to_mask(scores.shape[-1])
-                if thd_layout is None
-                else candidates.to_mask_thd(
-                    thd_layout.sequence_ids,
-                    compressed_layout.sequence_ids,
-                    compressed_layout.position_ids // self.compress_ratio,
-                )
-            )
+            candidates = candidates.to_mask(scores.shape[-1])
         if candidates is not None:
             scores = scores.masked_fill(~candidates, -torch.inf)
         return scores
@@ -944,6 +985,16 @@ class CompressedSparseAttention2(MegatronModule):
             output = fused_sparse_attention.csa_sparse_attn(
                 query, kv, self.attn_sink, flat_indices, self.softmax_scale, topk_length=lengths
             )
+        elif self.config.dsa_kernel_backend == "tilelang":
+            from .ops.tilelang_csa_sparse_mla import tilelang_csa_sparse_attn
+
+            output = tilelang_csa_sparse_attn(
+                query, kv, self.attn_sink, indices, self.softmax_scale
+            )
+            if output is None:
+                output = unfused_compressed_sparse_attn(
+                    query, kv.float(), self.attn_sink, indices, self.softmax_scale
+                )
         else:
             output = unfused_compressed_sparse_attn(
                 query, kv.float(), self.attn_sink, indices, self.softmax_scale
