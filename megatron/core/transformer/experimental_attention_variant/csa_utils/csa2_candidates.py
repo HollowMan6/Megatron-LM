@@ -8,6 +8,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+# Mirrors csa2.py's _SELECT_ROW_CHUNK_ELEMENTS: rows per stable-sort chunk, as
+# an element budget, so the CUDA sort workspace stays bounded.
+_SELECT_ROW_CHUNK_ELEMENTS = 1 << 24
+
 
 @dataclass(frozen=True)
 class CSA2CandidateBlocks:
@@ -79,9 +83,32 @@ def candidate_blocks_from_block_scores(
     block_scores = block_scores.masked_fill(
         torch.arange(num_blocks, device=block_scores.device) == newest, torch.inf
     )
-    ids = block_scores.argsort(dim=-1, descending=True, stable=True)[
-        ..., : min(topk_blocks, num_blocks)
-    ]
+    keep_blocks = min(topk_blocks, num_blocks)
+    # Zero blocks (no complete compression group) or zero rows keep the
+    # pre-chunking contract, which reshape/cat below cannot express.
+    if block_scores.numel() == 0:
+        return CSA2CandidateBlocks(
+            torch.empty(
+                *block_scores.shape[:-1],
+                keep_blocks,
+                dtype=torch.int32,
+                device=block_scores.device,
+            ),
+            block_size,
+        )
+    # A stable per-row sort is row-independent, so chunk the rows: one
+    # full-width argsort needs a workspace that scales with rows*num_blocks
+    # (12 GiB at 512K context's 16384x65536) and OOMs. Same discipline as
+    # CSA2Indexer.select_indices.
+    flat = block_scores.reshape(-1, num_blocks)
+    row_chunk = max(1, _SELECT_ROW_CHUNK_ELEMENTS // max(num_blocks, 1))
+    parts = []
+    for start in range(0, flat.shape[0], row_chunk):
+        block = flat[start : start + row_chunk]
+        parts.append(
+            block.argsort(dim=-1, descending=True, stable=True)[..., :keep_blocks]
+        )
+    ids = torch.cat(parts, dim=0).reshape(*block_scores.shape[:-1], keep_blocks)
     valid = block_scores.gather(-1, ids) > -torch.inf
     sentinel = torch.iinfo(torch.int32).max
     ids = ids.masked_fill(~valid, sentinel).sort(-1).values
