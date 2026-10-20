@@ -78,6 +78,11 @@ _SELECT_MERGE_STAGE_KEYS = 4096
 _FUSED_CHECK = os.environ.get("CSA2_FUSED_CHECK", "0") == "1"
 _check_reported: set = set()
 
+# Escape hatch: force the dense select (the streamed path is validated
+# bit-identical, but fused-path runs have intermittently stalled in a
+# collective on the cluster; dense runs complete).
+_FUSED_DISABLE = os.environ.get("CSA2_FUSED_DISABLE", "0") == "1"
+
 
 def _chunked_csa2_indexer_scores(
     q: torch.Tensor, indexer_k: torch.Tensor, weights: torch.Tensor, key_chunk_size: int = 64
@@ -1080,7 +1085,7 @@ class CompressedSparseAttention2(MegatronModule):
             # [b, s, keys]; the differentiable / indexer-loss path keeps the
             # dense scores (forward_before_topk + select_indices).
             fused = None
-            if not use_indexer_loss and thd_layout is not None:
+            if not use_indexer_loss and thd_layout is not None and not _FUSED_DISABLE:
                 fused = self.indexer.select_indices_fused(
                     x.detach(),
                     qr.detach(),
