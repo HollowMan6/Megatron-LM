@@ -10,6 +10,7 @@ state or inference caches.
 import os
 from copy import copy
 from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
@@ -126,6 +127,196 @@ def _chunked_candidate_block_scores(
 
 
 _NEG_INF_SCORE = float("-inf")
+
+
+def _streaming_indexer_topk(
+    q: torch.Tensor,
+    indexer_k: torch.Tensor,
+    weights: torch.Tensor,
+    topk: int,
+    compress_ratio: int,
+    thd_layout: CSA2THDLayout,
+    compressed_layout: CSA2THDCompressionLayout,
+    candidates: CSA2CandidateBlocks | torch.Tensor | None,
+    want_block_scores: bool,
+    candidate_block_size: int,
+    chunk_elements: int | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    """Fused no-grad THD select: stream key chunks, never build [b, s, keys].
+
+    Bit-identical to ``forward_before_topk`` + ``select_indices`` in the
+    no-grad THD regime:
+
+    - each chunk's scores use the same einsum/relu/head-sum arithmetic the
+      dense path computes, so no ULP drift is possible at the source;
+    - the running top-k set is kept key-index-ascending and each chunk's keys
+      are ascending, so ``[running ++ chunk]`` is index-ascending and a
+      stable descending argsort resolves ties to the lower key index --
+      exactly the dense select's stable-descending-lowest-index contract;
+    - masked entries are ``-inf`` before the merge, so non-finite winners
+      become ``-1`` exactly as in ``select_indices``.
+
+    With ``want_block_scores`` the same pass accumulates the candidate-source
+    layer's sequence-local per-block maxima by scatter-amax over the identical
+    chunk scores (max is exact and order-independent), matching the output of
+    ``_chunked_candidate_block_scores``.
+
+    Returns ``(indices [b, s, topk] int32 sorted ascending with -1 sentinels,
+    block_scores [s, num_local_blocks] fp32 | None)``.
+    """
+    s, b = q.shape[0], q.shape[1]
+    keys = indexer_k.shape[0]
+    k = min(topk, keys)
+    if want_block_scores and candidate_block_size <= 0:
+        raise ValueError("want_block_scores requires a positive candidate_block_size")
+    if keys == 0 or s == 0 or (k == 0 and not want_block_scores):
+        block_scores = None
+        if want_block_scores:
+            n_local_blocks = -(-compressed_layout.max_seqlen // candidate_block_size)
+            block_scores = torch.full(
+                (s, n_local_blocks), -torch.inf, device=q.device, dtype=torch.float32
+            )
+        return (
+            torch.empty(b, s, k, dtype=torch.int32, device=q.device),
+            block_scores,
+        )
+    if b != 1:
+        raise ValueError("the fused THD select requires the packed b=1 regime")
+    if chunk_elements is None:
+        chunk_elements = _SELECT_ROW_CHUNK_ELEMENTS
+    q = q.float()
+    indexer_k = indexer_k.float()
+    head_weights = weights.permute(1, 0, 2).unsqueeze(-1)
+
+    rows_pos = thd_layout.position_ids
+    rows_seq = thd_layout.sequence_ids
+    rows_valid = thd_layout.valid_tokens
+    key_chunk = max(1, chunk_elements // max(s * q.shape[2], 1))
+
+    # Candidate membership in the sequence-local block slot space, so each
+    # chunk costs one gather instead of a full [s, keys] expansion.
+    n_local_blocks = (
+        -(-compressed_layout.max_seqlen // candidate_block_size)
+        if candidate_block_size > 0
+        else 0
+    )
+    if isinstance(candidates, CSA2CandidateBlocks):
+        if candidate_block_size != candidates.block_size:
+            raise ValueError("candidate block size mismatch with the candidate set")
+        n_slots = int(compressed_layout.sequence_ids.max().item()) + 1 if keys else 1
+        member = torch.zeros(
+            (s, n_slots * n_local_blocks), dtype=torch.bool, device=q.device
+        )
+        ids = candidates.indices
+        valid_ids = ids >= 0
+        member[
+            torch.arange(s, device=q.device).unsqueeze(-1).expand_as(ids)[valid_ids],
+            (
+                rows_seq.clamp_min(0).unsqueeze(-1).expand_as(ids)[valid_ids]
+                * n_local_blocks
+                + ids[valid_ids].long()
+            ),
+        ] = True
+        member_of_chunk = None  # built per chunk below from `member`
+    else:
+        member = None
+        member_of_chunk = candidates  # a full bool tensor or None
+
+    block_table = None
+    slot_of_key = None
+    if want_block_scores or member is not None:
+        n_slots = int(compressed_layout.sequence_ids.max().item()) + 1 if keys else 1
+        if want_block_scores:
+            block_table = torch.full(
+                (s, n_slots * n_local_blocks), -torch.inf, device=q.device, dtype=torch.float32
+            )
+        key_local = torch.arange(keys, device=q.device) - compressed_layout.cu_seqlens_padded[
+            compressed_layout.sequence_ids.clamp_min(0)
+        ]
+        slot_of_key = (
+            compressed_layout.sequence_ids.clamp_min(0) * n_local_blocks
+            + key_local // candidate_block_size
+        )
+
+    run_idx = None
+    run_score = None
+    # Inner einsum chunks MUST match the dense path's fixed 64-key tiling
+    # bit-for-bit (a different GEMM tiling changes fp32 accumulation order
+    # and the tie/amax outcomes); the outer stage only batches merges.
+    dense_key_chunk = 64
+    stage = key_chunk - (key_chunk % dense_key_chunk)
+    stage = max(dense_key_chunk, stage)
+    for stage_start in range(0, keys, stage):
+        stage_end = min(stage_start + stage, keys)
+        width = stage_end - stage_start
+        chunk = torch.empty(b, s, width, device=q.device, dtype=torch.float32)
+        for start in range(stage_start, stage_end, dense_key_chunk):
+            end = min(start + dense_key_chunk, stage_end)
+            c = torch.einsum("sbhd,tbd->bsht", q, indexer_k[start:end]).relu()
+            chunk[..., start - stage_start : end - stage_start] = (c * head_weights).sum(dim=2)
+        keep = (
+            rows_valid[:, None]
+            & compressed_layout.valid_groups[None, stage_start:stage_end]
+            & (
+                rows_seq[:, None]
+                == compressed_layout.sequence_ids[None, stage_start:stage_end]
+            )
+            & (
+                compressed_layout.position_ids[None, stage_start:stage_end] + compress_ratio
+                <= rows_pos[:, None] + 1
+            )
+        )
+        if member is not None:
+            if slot_of_key is not None:
+                member_of_chunk = member[:, slot_of_key[stage_start:stage_end]]
+            else:
+                member_of_chunk = member[
+                    :,
+                    torch.div(
+                        torch.arange(stage_start, stage_end, device=q.device),
+                        candidate_block_size,
+                        rounding_mode="floor",
+                    ),
+                ]
+        elif isinstance(candidates, torch.Tensor):
+            member_of_chunk = candidates[..., stage_start:stage_end]
+        else:
+            member_of_chunk = None
+        if member_of_chunk is not None:
+            keep = keep & member_of_chunk
+        chunk = chunk.masked_fill(~keep, -torch.inf)
+        if block_table is not None:
+            block_table.scatter_reduce_(
+                1,
+                slot_of_key[None, stage_start:stage_end].expand(s, width),
+                chunk[0],
+                reduce="amax",
+                include_self=True,
+            )
+        ck_idx = stage_start + torch.arange(width, device=q.device).expand(b, s, width)
+        if run_idx is not None:
+            cat_score = torch.cat([run_score, chunk], dim=-1)
+            cat_idx = torch.cat([run_idx, ck_idx], dim=-1)
+        else:
+            cat_score, cat_idx = chunk, ck_idx
+        if cat_score.shape[-1] > k:
+            winners = cat_score.argsort(dim=-1, descending=True, stable=True)[..., :k]
+            sel_score = cat_score.gather(-1, winners)
+            sel_idx = cat_idx.gather(-1, winners)
+        else:
+            sel_score, sel_idx = cat_score, cat_idx
+        order = sel_idx.argsort(dim=-1, stable=True)  # keep index-ascending
+        run_score = sel_score.gather(-1, order)
+        run_idx = sel_idx.gather(-1, order)
+    indices = run_idx.masked_fill(~run_score.isfinite(), -1).int()
+    block_scores = None
+    if block_table is not None:
+        n_slots = block_table.shape[1] // n_local_blocks
+        own = block_table.view(s, n_slots, n_local_blocks)[
+            torch.arange(s, device=q.device), rows_seq.clamp_min(0)
+        ]
+        block_scores = own
+    return indices, block_scores
 
 
 @dataclass
@@ -431,6 +622,34 @@ class CSA2Indexer(MegatronModule):
             cp_group=self.cp_group,
         )
 
+    def _indexer_q_weights(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        rotary_pos_emb: nn.Module,
+        thd_layout: CSA2THDLayout | None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project q (post-RoPE) and the per-head weights, shared by the dense
+        score path and the fused streaming select so the two cannot drift."""
+        q, _ = self.linear_wq_b(qr)
+        q = q.reshape(*q.shape[:-1], self.n_heads, self.head_dim)
+        pos_dim = self.config.qk_pos_emb_head_dim
+        rope_kwargs = dict(
+            nope_dim=self.head_dim - pos_dim,
+            pos_dim=pos_dim,
+            rotary_pos_emb_module=rotary_pos_emb,
+            config=self.config,
+            cp_group=self.cp_group,
+        )
+        q = (
+            _apply_thd_rope(q, rotary_pos_emb, self.config, thd_layout, self.cp_group)
+            if thd_layout is not None
+            else _apply_rope(q, rotary_seq_len=q.shape[0], **rope_kwargs)
+        )
+        weights, _ = self.linear_weights_proj(x)
+        weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
+        return q, weights
+
     def forward_before_topk(
         self,
         x: torch.Tensor,
@@ -456,23 +675,7 @@ class CSA2Indexer(MegatronModule):
             indexer_k = self.project_keys(latent, rotary_pos_emb, compressed_layout)
         elif latent is not None:
             raise ValueError("Provide either latent or indexer_k, not both.")
-        q, _ = self.linear_wq_b(qr)
-        q = q.reshape(*q.shape[:-1], self.n_heads, self.head_dim)
-        pos_dim = self.config.qk_pos_emb_head_dim
-        rope_kwargs = dict(
-            nope_dim=self.head_dim - pos_dim,
-            pos_dim=pos_dim,
-            rotary_pos_emb_module=rotary_pos_emb,
-            config=self.config,
-            cp_group=self.cp_group,
-        )
-        q = (
-            _apply_thd_rope(q, rotary_pos_emb, self.config, thd_layout, self.cp_group)
-            if thd_layout is not None
-            else _apply_rope(q, rotary_seq_len=q.shape[0], **rope_kwargs)
-        )
-        weights, _ = self.linear_weights_proj(x)
-        weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
+        q, weights = self._indexer_q_weights(x, qr, rotary_pos_emb, thd_layout)
         if torch.is_grad_enabled():
             scores = torch.einsum("sbhd,tbd->bsht", q.float(), indexer_k.float()).relu()
             scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
@@ -595,6 +798,41 @@ class CSA2Indexer(MegatronModule):
             compressed_layout=compressed_layout,
         )
         return self.select_indices(scores)
+
+    @torch.no_grad()
+    def select_indices_fused(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        rotary_pos_emb: nn.Module,
+        *,
+        indexer_k: torch.Tensor,
+        thd_layout: CSA2THDLayout,
+        compressed_layout: CSA2THDCompressionLayout,
+        candidates: CSA2CandidateBlocks | torch.Tensor | None = None,
+        want_block_scores: bool = False,
+        candidate_block_size: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Stream the THD no-grad select without building [b, s, keys].
+
+        Produces exactly ``select_indices(forward_before_topk(...))`` for the
+        no-grad THD regime, plus (optionally) the candidate-source layer's
+        sequence-local block maxima in the same pass -- see
+        ``_streaming_indexer_topk`` for the bit-identity contract.
+        """
+        q, weights = self._indexer_q_weights(x, qr, rotary_pos_emb, thd_layout)
+        return _streaming_indexer_topk(
+            q,
+            indexer_k,
+            weights,
+            self.topk,
+            self.compress_ratio,
+            thd_layout,
+            compressed_layout,
+            candidates,
+            want_block_scores,
+            candidate_block_size,
+        )
 
     def backward_dw(self) -> None:
         """Follow the existing DSv4 linear gradient interface."""
@@ -766,17 +1004,34 @@ class CompressedSparseAttention2(MegatronModule):
                         f"{self.config.csa2_candidate_source_layer} in the same CSA2State."
                     )
                 candidates = state.candidates
-            with torch.set_grad_enabled(use_indexer_loss):
-                scores = self.indexer.forward_before_topk(
+            # The no-loss THD regime streams key chunks and never builds
+            # [b, s, keys]; the differentiable / indexer-loss path keeps the
+            # dense scores (forward_before_topk + select_indices).
+            fused = None
+            if not use_indexer_loss and thd_layout is not None:
+                fused = self.indexer.select_indices_fused(
                     x.detach(),
                     qr.detach(),
-                    None,
                     self.rotary_pos_emb,
                     indexer_k=state.indexer_k,
-                    candidates=candidates,
                     thd_layout=thd_layout,
                     compressed_layout=state.compressed_layout,
+                    candidates=candidates,
+                    want_block_scores=self.is_candidate_source,
+                    candidate_block_size=self.config.csa2_candidate_block_size,
                 )
+            if fused is None:
+                with torch.set_grad_enabled(use_indexer_loss):
+                    scores = self.indexer.forward_before_topk(
+                        x.detach(),
+                        qr.detach(),
+                        None,
+                        self.rotary_pos_emb,
+                        indexer_k=state.indexer_k,
+                        candidates=candidates,
+                        thd_layout=thd_layout,
+                        compressed_layout=state.compressed_layout,
+                    )
             with torch.no_grad():
                 if self.is_candidate_source:
                     if thd_layout is None:
@@ -786,6 +1041,15 @@ class CompressedSparseAttention2(MegatronModule):
                         state.candidates = candidate_blocks_from_scores(
                             scores,
                             visible,
+                            self.config.csa2_candidate_topk_blocks,
+                            self.config.csa2_candidate_block_size,
+                        )
+                    elif fused is not None:
+                        _indices, block_scores = fused
+                        visible = (thd_layout.position_ids + 1) // self.compress_ratio
+                        state.candidates = candidate_blocks_from_block_scores(
+                            block_scores.unsqueeze(0),
+                            visible.unsqueeze(0).unsqueeze(-1),
                             self.config.csa2_candidate_topk_blocks,
                             self.config.csa2_candidate_block_size,
                         )
@@ -821,7 +1085,11 @@ class CompressedSparseAttention2(MegatronModule):
                     state.candidate_source_layer = self.layer_idx
                 # The candidate source itself selects over all causal positions. Only later
                 # Reindex layers apply its candidate mask, matching the reference ordering.
-                state.global_indices = self.indexer.select_indices(scores)
+                # In fused mode the streaming pass already selected.
+                if fused is not None:
+                    state.global_indices = fused[0]
+                else:
+                    state.global_indices = self.indexer.select_indices(scores)
             state.index_source_layer = self.layer_idx
         elif state.index_source_layer != self.index_source_layer or state.global_indices is None:
             raise ValueError(

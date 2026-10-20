@@ -1306,6 +1306,118 @@ def test_chunked_candidate_block_scores_match_full_gather(monkeypatch):
     torch.testing.assert_close(from_blocks.indices, from_full.indices)
 
 
+def test_streaming_topk_matches_dense_thd(monkeypatch):
+    """The fused THD select is bit-identical to the dense path.
+
+    Pins _streaming_indexer_topk against the dense composition it replaces
+    (chunked einsum -> the forward_before_topk causal chain -> the select
+    contract; and the candidate-source fold against
+    _chunked_candidate_block_scores, the already-pinned oracle) across
+    ragged multi-sequence packs, exact-zero ReLU tie storms, the candidate
+    block mask, -1 sentinel rows, and multi-chunk splits via a tiny budget.
+    """
+    import dataclasses
+
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    torch.manual_seed(101)
+    ratio, topk, block_size = 2, 8, 8
+
+    @dataclasses.dataclass
+    class _Thd:
+        valid_tokens: torch.Tensor
+        sequence_ids: torch.Tensor
+        position_ids: torch.Tensor
+
+    @dataclasses.dataclass
+    class _Compressed:
+        cu_seqlens_padded: torch.Tensor
+        max_seqlen: int
+        valid_groups: torch.Tensor
+        sequence_ids: torch.Tensor
+        position_ids: torch.Tensor
+
+    # Three ragged sequences; per-sequence compressed capacity aligned to the block size.
+    row_counts = [96, 40, 52]
+    capacities = [48, 24, 32]  # compressed groups per sequence (ceil(rows/ratio) rounded)
+    s = sum(row_counts)
+    rows_seq = torch.cat(
+        [torch.full((n,), i, dtype=torch.int64, device="cuda") for i, n in enumerate(row_counts)]
+    )
+    rows_pos = torch.cat(
+        [torch.arange(n, dtype=torch.int64, device="cuda") for n in row_counts]
+    )
+    rows_valid = torch.ones(s, dtype=torch.bool, device="cuda")
+    rows_valid[-5:] = False  # padding tail: all-masked -> -1 sentinel rows
+    cu = torch.zeros(4, dtype=torch.int64, device="cuda")
+    cu[1:] = torch.tensor(capacities, device="cuda").cumsum(0)
+    keys = int(cu[-1])
+    key_seq = torch.cat(
+        [torch.full((c,), i, dtype=torch.int64, device="cuda") for i, c in enumerate(capacities)]
+    )
+    key_pos = torch.cat(
+        [torch.arange(c, dtype=torch.int64, device="cuda") * ratio for c in capacities]
+    )
+    # The last few groups of sequence 2 are padding (invalid).
+    valid_groups = torch.ones(keys, dtype=torch.bool, device="cuda")
+    valid_groups[-3:] = False
+    thd = _Thd(rows_valid, rows_seq, rows_pos)
+    comp = _Compressed(cu, max(capacities), valid_groups, key_seq, key_pos)
+
+    h, d = 4, 32
+    q = torch.randn(s, 1, h, d, device="cuda")
+    indexer_k = torch.randn(keys, 1, d, device="cuda")
+    indexer_k[: keys // 2].neg_()  # ReLU emits exact zeros: the tie-storm regime
+    weights = torch.randn(s, 1, h, device="cuda")
+
+    # Dense reference: the forward_before_topk no-grad THD math, verbatim.
+    scores = csa2_module._chunked_csa2_indexer_scores(q, indexer_k, weights)
+    causal = (
+        thd.valid_tokens[:, None]
+        & comp.valid_groups[None, :]
+        & (thd.sequence_ids[:, None] == comp.sequence_ids[None, :])
+        & (comp.position_ids[None, :] + ratio <= thd.position_ids[:, None] + 1)
+    )
+    scores = scores.masked_fill(~causal, -torch.inf)
+    k = min(topk, scores.shape[-1])
+    winners = scores.reshape(-1, scores.shape[-1]).argsort(dim=-1, descending=True, stable=True)
+    ref_indices = winners[..., :k].sort(dim=-1).values.reshape(1, s, k)
+    ref_indices = ref_indices.masked_fill(
+        ~scores.gather(-1, ref_indices).isfinite(), -1
+    ).int()
+    ref_blocks = csa2_module._chunked_candidate_block_scores(
+        scores.squeeze(0), thd.sequence_ids.clamp_min(0), comp, block_size
+    )
+
+    # Candidate mask case: random per-row candidate blocks.
+    ids = torch.randint(0, 4, (1, s, 3), dtype=torch.int32, device="cuda")
+    ids[0, -5:] = -1  # padding rows have no candidates
+    cand = CSA2CandidateBlocks(ids, block_size)
+    cand_mask = cand.to_mask_thd(
+        thd.sequence_ids, comp.sequence_ids, comp.position_ids // ratio
+    )
+    scores_c = scores.masked_fill(~cand_mask, -torch.inf)
+    winners_c = scores_c.reshape(-1, scores_c.shape[-1]).argsort(
+        dim=-1, descending=True, stable=True
+    )
+    ref_c = winners_c[..., :k].sort(dim=-1).values.reshape(1, s, k)
+    ref_c = ref_c.masked_fill(~scores_c.gather(-1, ref_c).isfinite(), -1).int()
+
+    # Fused: multi-chunk via a tiny budget.
+    monkeypatch.setattr(csa2_module, "_SELECT_ROW_CHUNK_ELEMENTS", 256)
+    got_indices, got_blocks = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, None, True, block_size
+    )
+    got_c, _ = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, cand, False, block_size
+    )
+
+    torch.testing.assert_close(got_indices, ref_indices, rtol=0, atol=0)
+    torch.testing.assert_close(got_blocks, ref_blocks, rtol=0, atol=0)
+    torch.testing.assert_close(got_c, ref_c, rtol=0, atol=0)
+    assert (got_indices[0, -5:] == -1).all()  # sentinel rows survive the streaming merge
+
+
 @pytest.mark.parametrize("width", [0, 1, 3, 17, 1025])
 def test_compact_candidates_match_dense_mask_and_bound_retained_storage(width):
     torch.manual_seed(92)
