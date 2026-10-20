@@ -2,9 +2,34 @@
 
 """Validation of the logical CSA2 layer schedule, independent of stack layout."""
 
+import importlib
 import math
 
 import torch
+
+_TILELANG_BACKEND_MODULES = ("tilelang", "tvm_ffi")
+
+
+def _validate_tilelang_backend_dependencies() -> None:
+    """Fail fast when the CSA2 TileLang sparse-MLA kernel cannot run here.
+
+    The adapter imports TileLang and the TVM FFI when it is first used and then
+    compiles a kernel; checking the imports while validating the config turns a
+    missing dependency into an actionable error instead of an ImportError deep
+    inside the first attention forward.
+    """
+    missing = []
+    for module in _TILELANG_BACKEND_MODULES:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            missing.append(module)
+    if missing:
+        raise ImportError(
+            "dsa_kernel_backend='tilelang' requires the CSA2 sparse-MLA kernel runtime "
+            f"(missing: {', '.join(missing)}); install TileLang with its TVM FFI runtime, "
+            "or select dsa_kernel_backend='cudnn' or 'none'."
+        )
 
 
 def validate_csa2_config(config) -> None:
@@ -17,9 +42,11 @@ def validate_csa2_config(config) -> None:
         raise NotImplementedError("CSA2 currently requires TP=1")
     if config.fp16 or config.params_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError("CSA2 supports FP32 or BF16 parameters")
-    if config.dsa_kernel_backend not in ("none", "cudnn"):
-        raise ValueError("CSA2 supports the native and cuDNN sparse attention backends")
-    if config.dsa_kernel_backend == "cudnn" and config.params_dtype != torch.bfloat16:
+    if config.dsa_kernel_backend not in ("none", "cudnn", "tilelang"):
+        raise ValueError("CSA2 supports the native, cuDNN and TileLang sparse attention backends")
+    if config.dsa_kernel_backend == "tilelang":
+        _validate_tilelang_backend_dependencies()
+    if config.dsa_kernel_backend != "none" and config.params_dtype != torch.bfloat16:
         raise ValueError("Fused CSA2 attention requires BF16 parameters")
     if config.attention_dropout or config.hidden_dropout:
         raise ValueError("CSA2 currently requires zero attention and hidden dropout")
