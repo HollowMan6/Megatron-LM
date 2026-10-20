@@ -845,22 +845,52 @@ class HyperConnectionModule(MegatronModule):
             sb = streams.shape[0] * streams.shape[1]
             h_res_2d = h_res.float().reshape(sb, self.n, self.n)
             streams_2d = streams.reshape(sb, self.n, self.hidden_size)
-            row_chunk = max(1, (256 * 1024**2) // (self.n * self.hidden_size * 4))
-            mixed_rows = []
+            row_chunk = max(1, (64 * 1024**2) // (self.n * self.hidden_size * 4))
+            # Accumulate bmm chunks into one preallocated output: torch.cat
+            # over chunk results materialized a second full-width tensor
+            # (374 MiB at 4.7K rows/rank) on top of the live chunks.
+            mixed = torch.empty(
+                sb, self.n, self.hidden_size,
+                dtype=torch.float32, device=streams_2d.device,
+            )
             for start in range(0, sb, row_chunk):
                 end = min(start + row_chunk, sb)
-                mixed_rows.append(
-                    torch.bmm(
-                        h_res_2d[start:end].transpose(1, 2), streams_2d[start:end]
-                    )
+                # copy_ into the preallocated buffer: autograd forbids out= on
+                # grad-tracked bmm inside the recompute; the copy keeps the
+                # peak at one chunk on top of `mixed` (no cat, no second
+                # full-width tensor).
+                mixed[start:end].copy_(
+                    torch.bmm(h_res_2d[start:end].transpose(1, 2), streams_2d[start:end])
                 )
-            mixed = torch.cat(mixed_rows, dim=0).view(
-                streams.shape[0], streams.shape[1], self.n, self.hidden_size
-            )
+            # Expand in row chunks, accumulating into `mixed` in place. The
+            # reference built a full-width `expanded` plus a third
+            # `mixed + expanded` temporary; both are row-independent, so the
+            # chunked form keeps one [chunk, hidden] fp32 slab alive per stream
+            # (this runs per layer during backward recompute).
+            # branch: [s, b, C]; h_post: [s, b, n]; the expansion is
+            # h_post[..., None] * branch[..., None, :] -> [s, b, n, C].
             branch = x.float() if bias is None else x.float() + bias.float()
-            expanded = h_post.float().unsqueeze(-1) * branch.unsqueeze(-2)
-            expanded = F.dropout(expanded, p=dropout_prob, training=training)
-            return (mixed + expanded).flatten(-2).to(x.dtype)
+            sb = branch.shape[0] * branch.shape[1]
+            branch_rows = branch.reshape(sb, branch.shape[-1])
+            h_post_rows = h_post.float().reshape(sb, self.n)
+            chunk = max(1, (32 * 1024**2) // max(self.hidden_size * 4, 1))
+            for start in range(0, sb, chunk):
+                end = min(start + chunk, sb)
+                for stream in range(self.n):
+                    exp = h_post_rows[start:end, stream, None] * branch_rows[start:end]
+                    exp = F.dropout(exp, p=dropout_prob, training=training)
+                    mixed[start:end, stream] += exp
+            out = mixed.view(streams.shape[0], streams.shape[1], self.n * self.hidden_size)
+            import os as _os_nan
+            if _os_nan.environ.get("MINT_NAN_DEBUG") == "1" and not torch.isfinite(out).all():
+                raise RuntimeError(
+                    "MINT_NAN_DEBUG: non-finite mHC bda output "
+                    f"out={tuple(out.shape)} res_finite={bool(torch.isfinite(original_residual).all())} "
+                    f"x_finite={bool(torch.isfinite(x).all())} "
+                    f"h_post_finite={bool(torch.isfinite(h_post).all())} "
+                    f"h_res_finite={bool(torch.isfinite(h_res).all())}"
+                )
+            return out.to(x.dtype)
 
     def _fused_h_res_h_post_bda_native(
         self,

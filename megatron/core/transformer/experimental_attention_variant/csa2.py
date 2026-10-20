@@ -7,6 +7,7 @@ tensors belong to one stack forward and are passed explicitly; modules retain no
 state or inference caches.
 """
 
+import os
 from copy import copy
 from dataclasses import dataclass
 
@@ -998,6 +999,15 @@ class CompressedSparseAttention2(MegatronModule):
         else:
             output = unfused_compressed_sparse_attn(
                 query, kv.float(), self.attn_sink, indices, self.softmax_scale
+            )
+        if os.environ.get("MINT_NAN_DEBUG") == "1" and not torch.isfinite(output).all():
+            raise RuntimeError(
+                "MINT_NAN_DEBUG: non-finite sparse-attention output "
+                f"layer={self.layer_idx} backend={self.config.dsa_kernel_backend} "
+                f"q={tuple(query.shape)} kv={tuple(kv.shape)} idx={tuple(indices.shape)} "
+                f"idx_min={int(indices.min())} idx_max={int(indices.max())} "
+                f"kv_finite={bool(torch.isfinite(kv).all())} "
+                f"q_finite={bool(torch.isfinite(query).all())}"
             )
         if indexer_loss is not None:
             # The tracker averages microbatches, so report a token mean in either
