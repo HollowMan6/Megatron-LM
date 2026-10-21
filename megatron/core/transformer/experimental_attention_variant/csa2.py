@@ -187,8 +187,9 @@ def _streaming_indexer_topk(
     scores: the block maxima are the statistic the candidate set is derived
     from, so they cannot depend on a candidate set.
 
-    Returns ``(indices [b, s, topk] int32 sorted ascending with -1 sentinels,
-    block_scores [s, num_local_blocks] fp32 | None)``.
+    Returns ``(indices [b, s, min(topk, keys)] int32 sorted ascending with -1
+    sentinels, block_scores [s, num_local_blocks] fp32 | None)``. The width stays
+    fixed even when fewer keys are live, matching ``select_indices``.
     """
     s, b = q.shape[0], q.shape[1]
     keys = indexer_k.shape[0]
@@ -218,10 +219,22 @@ def _streaming_indexer_topk(
     n_local_blocks = (
         -(-compressed_layout.max_seqlen // candidate_block_size) if candidate_block_size > 0 else 0
     )
+    # The slot space below is addressed by the ROW sequence ids (candidate
+    # membership and the block table read) as well as by the compressed keys'
+    # (slot_of_key), so its width must cover the maximum over BOTH. Sizing it from
+    # the keys alone ran a trailing sequence's rows past the end whenever that
+    # sequence owns no compressed group -- fewer rows than the compression ratio,
+    # or a fully masked one -- and those rows still have to be addressed: they
+    # match no key's sequence id, so nothing is causally visible to them and their
+    # selection is all -1. The clamp keeps the empty/-1-only cases at one slot.
+    n_slots = 0
+    if isinstance(candidates, CSA2CandidateBlocks) or want_block_scores:
+        n_slots = (
+            max(int(rows_seq.max().item()), int(compressed_layout.sequence_ids.max().item()), 0) + 1
+        )
     if isinstance(candidates, CSA2CandidateBlocks):
         if candidate_block_size != candidates.block_size:
             raise ValueError("candidate block size mismatch with the candidate set")
-        n_slots = int(compressed_layout.sequence_ids.max().item()) + 1 if keys else 1
         member = torch.zeros((s, n_slots * n_local_blocks), dtype=torch.bool, device=q.device)
         ids = candidates.indices
         valid_ids = ids >= 0
@@ -240,7 +253,6 @@ def _streaming_indexer_topk(
     block_table = None
     slot_of_key = None
     if want_block_scores or member is not None:
-        n_slots = int(compressed_layout.sequence_ids.max().item()) + 1 if keys else 1
         if want_block_scores:
             block_table = torch.full(
                 (s, n_slots * n_local_blocks), -torch.inf, device=q.device, dtype=torch.float32
@@ -396,6 +408,16 @@ def _streaming_indexer_topk(
         # masked dense select would produce.
         indices = torch.full((b, s, k), -1, dtype=torch.int32, device=q.device)
     else:
+        if run_idx.shape[-1] < k:
+            # Fewer LIVE keys than k (a candidate- or causal-masked pack, or a
+            # trailing sequence with almost no visible key): the merge can only
+            # ever hold the staged keys, so it is narrower than the fixed width
+            # select_indices always returns. Right-pad: the missing entries are
+            # exactly the dense select's -1 sentinels, and the padding keeps the
+            # index-ascending order the dense path's sort produces.
+            pad = k - run_idx.shape[-1]
+            run_idx = F.pad(run_idx, (0, pad), value=-1)
+            run_score = F.pad(run_score, (0, pad), value=-torch.inf)
         indices = run_idx.masked_fill(~run_score.isfinite(), -1).int()
     block_scores = None
     if block_table is not None:

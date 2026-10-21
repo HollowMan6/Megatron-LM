@@ -1530,6 +1530,179 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     assert (none_got == -1).all()
 
 
+def _dense_thd_select(q, indexer_k, weights, thd, comp, ratio, topk, candidates=None):
+    """Dense oracle: chunked scores -> the forward_before_topk causal chain -> select_indices.
+
+    Returns ``(indices, causal_scores)``; the scores are the pre-candidate slab the
+    candidate-source block statistic is reduced from.
+    """
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    scores = csa2_module._chunked_csa2_indexer_scores(q, indexer_k, weights)
+    causal = (
+        thd.valid_tokens[:, None]
+        & comp.valid_groups[None, :]
+        & (thd.sequence_ids[:, None] == comp.sequence_ids[None, :])
+        & (comp.position_ids[None, :] + ratio <= thd.position_ids[:, None] + 1)
+    )
+    scores = scores.masked_fill(~causal, -torch.inf)
+    selected = scores
+    if candidates is not None:
+        selected = scores.masked_fill(
+            ~candidates.to_mask_thd(
+                thd.sequence_ids, comp.sequence_ids, comp.position_ids // ratio
+            ),
+            -torch.inf,
+        )
+    return CSA2Indexer.select_indices(SimpleNamespace(topk=topk), selected), scores
+
+
+def test_streaming_topk_pads_the_selection_to_k():
+    """A pack with fewer live keys than k keeps the dense select's fixed width.
+
+    Both key skips can leave the merge with fewer columns than k: the causal skip
+    when the pack's valid groups stop before k keys, and the candidate skip when
+    fewer than k keys sit in the live 64-key tiles. select_indices always returns
+    min(topk, keys) columns with -1 past the live entries, and the selection is
+    concatenated with the local indices, so the streamed select must right-pad
+    instead of returning a narrower tensor.
+    """
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(701)
+    ratio, block_size = 2, 8
+
+    # (1) Causal skip: the pack's valid groups stop after three keys, so only
+    #     three live keys can ever be staged against k = 8.
+    topk, keys, rows = 8, 16, 16
+    thd = SimpleNamespace(
+        valid_tokens=torch.ones(rows, dtype=torch.bool, device="cuda"),
+        sequence_ids=torch.zeros(rows, dtype=torch.int64, device="cuda"),
+        position_ids=torch.arange(rows, dtype=torch.int64, device="cuda"),
+    )
+    valid_groups = torch.zeros(keys, dtype=torch.bool, device="cuda")
+    valid_groups[:3] = True
+    comp = SimpleNamespace(
+        cu_seqlens_padded=torch.tensor([0, keys], dtype=torch.int64, device="cuda"),
+        max_seqlen=keys,
+        valid_groups=valid_groups,
+        sequence_ids=torch.zeros(keys, dtype=torch.int64, device="cuda"),
+        position_ids=torch.arange(keys, dtype=torch.int64, device="cuda") * ratio,
+    )
+    q = torch.randn(rows, 1, 4, 32, device="cuda", generator=gen)
+    indexer_k = torch.randn(keys, 1, 32, device="cuda", generator=gen)
+    weights = torch.randn(rows, 1, 4, device="cuda", generator=gen)
+    got, _ = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, None, False, block_size
+    )
+    ref, _ = _dense_thd_select(q, indexer_k, weights, thd, comp, ratio, topk)
+    assert got.shape == (1, rows, topk) == ref.shape
+    assert got.dtype == torch.int32
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+    assert (got[0, :, 3:] == -1).all()  # nothing past the three live keys is selectable
+
+    # (2) Candidate skip: k exceeds one live 64-key tile. Only block 0 (the first
+    #     eight keys) is a candidate block, so the staged tile holds 64 keys while
+    #     k = 72: the merge is narrower than k even though 128 keys exist.
+    topk, keys, rows = 72, 128, 40
+    thd = SimpleNamespace(
+        valid_tokens=torch.ones(rows, dtype=torch.bool, device="cuda"),
+        sequence_ids=torch.zeros(rows, dtype=torch.int64, device="cuda"),
+        position_ids=torch.arange(rows, dtype=torch.int64, device="cuda"),
+    )
+    comp = SimpleNamespace(
+        cu_seqlens_padded=torch.tensor([0, keys], dtype=torch.int64, device="cuda"),
+        max_seqlen=keys,
+        valid_groups=torch.ones(keys, dtype=torch.bool, device="cuda"),
+        sequence_ids=torch.zeros(keys, dtype=torch.int64, device="cuda"),
+        position_ids=torch.arange(keys, dtype=torch.int64, device="cuda") * ratio,
+    )
+    q = torch.randn(rows, 1, 4, 32, device="cuda", generator=gen)
+    indexer_k = torch.randn(keys, 1, 32, device="cuda", generator=gen)
+    weights = torch.randn(rows, 1, 4, device="cuda", generator=gen)
+    cand = CSA2CandidateBlocks(
+        torch.zeros((1, rows, 1), dtype=torch.int32, device="cuda"), block_size
+    )
+    got, _ = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, cand, False, block_size
+    )
+    ref, _ = _dense_thd_select(q, indexer_k, weights, thd, comp, ratio, topk, cand)
+    assert got.shape == (1, rows, topk) == ref.shape
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+    assert (got[0, :, block_size:] == -1).all()  # only block 0's keys are candidates
+
+
+def test_streaming_topk_sizes_the_slot_space_by_rows_not_keys():
+    """A trailing sequence with rows but no compressed key must not index past the slot space.
+
+    The candidate slot space and the candidate-source block table are addressed by the ROW
+    sequence id, but were sized from the compressed keys' maximum sequence id. A packed batch
+    whose trailing sequence is shorter than the compression ratio owns no compressed group,
+    so it had no slot at all and the fused select raised an out-of-bounds index. Those rows
+    match no key's sequence id, so nothing is causally visible to them: the dense path selects
+    an all -1 row, and the candidate-source block table's slot for them is all -inf.
+    """
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(909)
+    ratio, topk, block_size = 2, 8, 8
+    row_counts = [96, 1]  # the trailer is shorter than `ratio`: no compressed group
+    capacities = [48, 0]
+    s = sum(row_counts)
+    rows_seq = torch.cat(
+        [torch.full((n,), i, dtype=torch.int64, device="cuda") for i, n in enumerate(row_counts)]
+    )
+    rows_pos = torch.cat([torch.arange(n, dtype=torch.int64, device="cuda") for n in row_counts])
+    thd = SimpleNamespace(
+        valid_tokens=torch.ones(s, dtype=torch.bool, device="cuda"),
+        sequence_ids=rows_seq,
+        position_ids=rows_pos,
+    )
+    cu = torch.zeros(len(capacities) + 1, dtype=torch.int64, device="cuda")
+    cu[1:] = torch.tensor(capacities, dtype=torch.int64, device="cuda").cumsum(0)
+    keys = int(cu[-1])
+    n_local_blocks = -(-max(capacities) // block_size)
+    comp = SimpleNamespace(
+        cu_seqlens_padded=cu,
+        max_seqlen=max(capacities),
+        valid_groups=torch.ones(keys, dtype=torch.bool, device="cuda"),
+        sequence_ids=torch.zeros(keys, dtype=torch.int64, device="cuda"),
+        position_ids=torch.arange(keys, dtype=torch.int64, device="cuda") * ratio,
+    )
+    q = torch.randn(s, 1, 4, 32, device="cuda", generator=gen)
+    indexer_k = torch.randn(keys, 1, 32, device="cuda", generator=gen)
+    weights = torch.randn(s, 1, 4, device="cuda", generator=gen)
+    # Every row carries candidate blocks, the trailer included: its sequence id is
+    # the index that used to run past the end of the key-sized slot space.
+    ids = torch.randint(
+        0, n_local_blocks, (1, s, 2), dtype=torch.int32, device="cuda", generator=gen
+    )
+    cand = CSA2CandidateBlocks(ids, block_size)
+
+    ref, scores = _dense_thd_select(q, indexer_k, weights, thd, comp, ratio, topk, cand)
+    got, _ = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, cand, False, block_size
+    )
+    assert got.shape == (1, s, topk) == ref.shape
+    assert got.dtype == torch.int32
+    torch.testing.assert_close(got, ref, rtol=0, atol=0)
+    assert (got[0, -row_counts[1] :] == -1).all()  # no key can be visible to the trailer
+
+    # The candidate-source block table is sized the same way: the trailer must read
+    # its own all -inf slot instead of indexing past the end.
+    _, block_scores = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, None, True, block_size
+    )
+    ref_blocks = csa2_module._chunked_candidate_block_scores(
+        scores.squeeze(0), thd.sequence_ids.clamp_min(0), comp, block_size
+    )
+    assert block_scores.shape == (s, n_local_blocks)
+    torch.testing.assert_close(block_scores, ref_blocks, rtol=0, atol=0)
+    assert (block_scores[-row_counts[1] :] == -torch.inf).all()
+
+
 def test_streaming_block_scores_fold_causal_maxima_with_a_candidate_set():
     """want_block_scores folds the causal maxima even when candidates are supplied.
 
