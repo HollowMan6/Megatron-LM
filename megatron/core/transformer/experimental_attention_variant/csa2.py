@@ -761,6 +761,10 @@ class CSA2Indexer(MegatronModule):
         if thd_layout is None:
             visible = torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
             causal = torch.arange(indexer_k.shape[0], device=x.device)[None, :] < visible[:, None]
+            # The THD branch below masks its score slabs in place; the dense form keeps
+            # the pre-regression application here (without it the dense path selects
+            # non-causal global keys and packed/dense parity breaks).
+            scores = scores.masked_fill(~causal, -torch.inf)
         else:
             # One materialized [tokens, groups] buffer, accumulated in place: the
             # chained `&` form materialized one full bool matrix per clause
