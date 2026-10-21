@@ -36,6 +36,9 @@ from megatron.core.transformer.experimental_attention_variant.csa2_module_spec i
     csa2_attention_spec,
     get_csa2_module_spec_for_backend,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    csa2_candidates as csa2_candidates_module,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
     CSA2CandidateBlocks,
     candidate_blocks_from_block_scores,
@@ -1217,7 +1220,7 @@ def test_select_indices_stable_selection_survives_chunking(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Candidate tensors use CUDA")
-def test_thd_candidate_mask_matches_sequence_local_block_lookup():
+def test_thd_candidate_mask_matches_sequence_local_block_lookup(monkeypatch):
     blocks = CSA2CandidateBlocks(
         torch.tensor([[[0, 1, -1], [0, -1, -1], [1, 9, -1], [1, -1, -1]]]), block_size=2
     )
@@ -1230,6 +1233,15 @@ def test_thd_candidate_mask_matches_sequence_local_block_lookup():
     torch.testing.assert_close(
         blocks.to_mask_thd(query_sequences, key_sequences, key_positions), expected
     )
+    # A two-row budget forces several row chunks: the helper chunks the row
+    # dimension (not the batch dimension, which is 1 here) and folds the
+    # sequence-membership test into each slab, so the mask must be unchanged.
+    monkeypatch.setattr(
+        csa2_candidates_module, "_MASK_ROW_CHUNK_ELEMENTS", 2 * key_positions.numel()
+    )
+    chunked = blocks.to_mask_thd(query_sequences, key_sequences, key_positions)
+    assert chunked.shape == expected.shape
+    torch.testing.assert_close(chunked, expected)
 
 
 def test_candidate_blocks_exclude_old_blocks_and_force_newest():
@@ -1802,6 +1814,76 @@ def test_streaming_block_scores_fold_causal_maxima_with_a_candidate_set():
     )
     torch.testing.assert_close(got_blocks, ref_blocks, rtol=0, atol=0)
     torch.testing.assert_close(got_indices, ref_c, rtol=0, atol=0)
+
+
+def test_fused_check_also_compares_the_candidate_source_block_scores(pg_collection, monkeypatch):
+    """CSA2_FUSED_CHECK gates the block-score fold, not just the selection.
+
+    Every later Reindex layer ranks its candidate set from the candidate-source
+    layer's block maxima, so a fold bug can leave this layer's selection
+    bit-equal and still corrupt the next layer's candidates. The gate must
+    compare fused block scores against the dense reduction bit-exactly; a fold
+    that only perturbs the maxima must raise the block-score RuntimeError while
+    the index comparison still passes.
+    """
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    layer = _layer(
+        pg_collection,
+        2,
+        csa2_candidate_source_layer=0,
+        csa2_candidate_topk_blocks=2,
+        csa2_candidate_block_size=8,
+    )
+    # eval() drops the indexer-loss path, which is what enables the fused select.
+    layer.eval()
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32),
+        cu_seqlens_kv=torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32),
+        cu_seqlens_kv_padded=torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32),
+        max_seqlen_q=7,
+        max_seqlen_kv=7,
+    )
+    x = torch.randn(12, 1, layer.config.hidden_size, device="cuda")
+    x[[3, 4, 9, 10, 11]] = float("nan")
+
+    monkeypatch.setattr(csa2_module, "_FUSED_CHECK", True)
+    monkeypatch.setattr(csa2_module, "_FUSED_DISABLE", False)  # the fused path must run
+    csa2_module._check_reported.clear()
+    compared = []
+    dense_block_scores = csa2_module._dense_candidate_block_scores
+
+    def recording_reduction(*args, **kwargs):
+        compared.append(1)
+        return dense_block_scores(*args, **kwargs)
+
+    monkeypatch.setattr(csa2_module, "_dense_candidate_block_scores", recording_reduction)
+    layer(x, None, packed_seq_params=packed)  # the real fold passes the gate
+    assert compared, "the cross-check compared indices but not block scores"
+
+    # Perturb only the block-score fold: the returned selection is untouched, so
+    # the index comparison passes and only the block-score comparison can fire.
+    streaming = csa2_module._streaming_indexer_topk
+    folds = []
+
+    def perturbed_fold(*args, **kwargs):
+        indices, block_scores = streaming(*args, **kwargs)
+        folds.append(block_scores.clone())
+        return indices, torch.where(torch.isfinite(block_scores), block_scores + 0.25, block_scores)
+
+    monkeypatch.setattr(csa2_module, "_streaming_indexer_topk", perturbed_fold)
+    with pytest.raises(RuntimeError) as failure:
+        layer(x, None, packed_seq_params=packed)
+    message = str(failure.value)
+    fused_blocks = folds[-1]
+    differing = int(torch.isfinite(fused_blocks).any(dim=-1).sum())
+    assert differing > 0  # the fixture has rows whose block maxima are finite
+    assert "block-score mismatch" in message
+    assert f"{differing} of {fused_blocks.shape[0]} rows differ" in message
+    magnitude = float(message.rsplit("max|fused-dense|=", 1)[1])
+    assert 0.24 < magnitude < 0.26
 
 
 @pytest.mark.parametrize("width", [0, 1, 3, 17, 1025])

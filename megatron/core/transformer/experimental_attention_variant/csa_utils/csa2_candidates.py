@@ -12,6 +12,11 @@ from torch import Tensor
 # an element budget, so the CUDA sort workspace stays bounded.
 _SELECT_ROW_CHUNK_ELEMENTS = 1 << 24
 
+# Mirrors csa2.py's _MASK_ROW_CHUNK_ELEMENTS: rows per row-chunk when a bool mask
+# is expanded onto a [rows, keys] slab, as a bool-element budget (1 byte per
+# element, so a 16 MiB live slab).
+_MASK_ROW_CHUNK_ELEMENTS = 16 * 1024**2
+
 
 @dataclass(frozen=True)
 class CSA2CandidateBlocks:
@@ -50,19 +55,31 @@ class CSA2CandidateBlocks:
         invalid = (self.indices < 0) | (self.indices >= num_blocks)
         flags.scatter_(-1, self.indices.masked_fill(invalid, num_blocks).long(), True)
         key_blocks = key_local_positions.div(self.block_size, rounding_mode="floor").long()
-        # Row-chunked gather: the single-shot gather materializes one
-        # [query, num_keys] bool matrix per call (~2.7 GiB at 9.5K packed rows x
-        # compressed keys); chunking keeps one slab alive, identical semantics.
-        n_rows = self.indices.shape[0] if self.indices.ndim >= 2 else 1
-        out = torch.empty(
-            (*self.indices.shape[:-1], num_keys), dtype=torch.bool, device=self.indices.device
-        )
-        row_chunk = max(1, (16 * 1024**2) // max(num_keys, 1))
+        # Row-chunked gather + compare. `indices` is [batch, rows, candidates] and
+        # the packed THD select runs batch 1, so chunking the batch dimension left
+        # the whole [rows, num_keys] bool matrix live -- the gather slab, the
+        # sequence-membership comparison and their `&`, ~2.7 GiB each at 9.5K packed
+        # rows x compressed keys. Chunk the flattened row dimension instead, so one
+        # bool row-slab is live per step; gather + compare is elementwise, so the
+        # packed [batch, rows, keys] mask is unchanged.
+        leading = self.indices.shape[:-1]
+        n_seq = self.indices.shape[-2] if len(leading) >= 2 else 1
+        n_rows = self.indices[..., 0].numel()
+        batch = n_rows // n_seq if n_seq else 0
+        out = torch.empty((*leading, num_keys), dtype=torch.bool, device=self.indices.device)
+        flat_flags = flags.reshape(n_rows, flags.shape[-1])
+        flat_out = out.reshape(n_rows, num_keys)
+        # Rows are batch-major and the sequence-membership test ignores the batch,
+        # so a batch-major repeat of the per-row query sequence ids is exact.
+        row_query = query_sequence_ids.repeat(batch) if batch > 1 else query_sequence_ids
+        blocks = key_blocks.unsqueeze(0).expand(n_rows, num_keys)
+        row_chunk = max(1, _MASK_ROW_CHUNK_ELEMENTS // max(num_keys, 1))
         for start in range(0, n_rows, row_chunk):
             end = min(start + row_chunk, n_rows)
-            blocks = key_blocks.expand(*self.indices[start:end].shape[:-1], num_keys)
-            out[start:end] = flags[start:end].gather(-1, blocks)
-        return out & (query_sequence_ids[None, :, None] == key_sequence_ids[None, None, :])
+            slab = flat_flags[start:end].gather(-1, blocks[start:end])
+            slab &= row_query[start:end, None] == key_sequence_ids[None, :]
+            flat_out[start:end] = slab
+        return out
 
 
 @torch.no_grad()
@@ -89,10 +106,7 @@ def candidate_blocks_from_block_scores(
     if block_scores.numel() == 0:
         return CSA2CandidateBlocks(
             torch.empty(
-                *block_scores.shape[:-1],
-                keep_blocks,
-                dtype=torch.int32,
-                device=block_scores.device,
+                *block_scores.shape[:-1], keep_blocks, dtype=torch.int32, device=block_scores.device
             ),
             block_size,
         )
@@ -105,9 +119,7 @@ def candidate_blocks_from_block_scores(
     parts = []
     for start in range(0, flat.shape[0], row_chunk):
         block = flat[start : start + row_chunk]
-        parts.append(
-            block.argsort(dim=-1, descending=True, stable=True)[..., :keep_blocks]
-        )
+        parts.append(block.argsort(dim=-1, descending=True, stable=True)[..., :keep_blocks])
     ids = torch.cat(parts, dim=0).reshape(*block_scores.shape[:-1], keep_blocks)
     valid = block_scores.gather(-1, ids) > -torch.inf
     sentinel = torch.iinfo(torch.int32).max

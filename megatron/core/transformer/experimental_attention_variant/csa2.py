@@ -150,6 +150,32 @@ def _chunked_candidate_block_scores(
     return block_scores
 
 
+def _dense_candidate_block_scores(
+    scores: torch.Tensor,
+    thd_layout: CSA2THDLayout,
+    compressed: CSA2THDCompressionLayout,
+    candidate_block_size: int,
+) -> torch.Tensor:
+    """The dense path's candidate-source statistic for ``scores`` ``[1, rows, keys]``.
+
+    Sequence-local causal block maxima, one row per query token and one column per
+    local key block, exactly what ``candidate_blocks_from_block_scores`` ranks.
+    Shared by the dense candidate-source branch and the CSA2_FUSED_CHECK
+    cross-check, so the check compares the fused fold against the same reduction
+    the dense path derives its own candidate set from.
+    """
+    if scores.shape[-1]:
+        return _chunked_candidate_block_scores(
+            scores.squeeze(0),
+            thd_layout.sequence_ids.clamp_min(0),
+            compressed,
+            candidate_block_size,
+        )
+    # A pack with no compressed key has no block to score: every block is -inf.
+    num_blocks = -(-compressed.max_seqlen // candidate_block_size)
+    return scores.new_full((thd_layout.sequence_ids.shape[0], num_blocks), -torch.inf)
+
+
 _NEG_INF_SCORE = float("-inf")
 
 
@@ -254,6 +280,18 @@ def _streaming_indexer_topk(
     slot_of_key = None
     if want_block_scores or member is not None:
         if want_block_scores:
+            # [rows, n_slots * n_local_blocks] fp32, i.e. [rows, n_blocks] for a
+            # single-sequence pack (n_slots == 1). The width is the
+            # candidate-source layer's contract, not an accident of this fold:
+            # the dense path's _chunked_candidate_block_scores returns the same
+            # [rows, n_blocks] table and candidate_blocks_from_block_scores ranks
+            # it, so a fold that matches the dense reference can only ever hold
+            # that many values. At 16384 rows x 524288 keys that is 4 GiB with
+            # candidate_block_size=8 (65536 blocks/row) and 32 GiB with
+            # candidate_block_size=1 (524288 blocks/row); candidate_block_size is
+            # the config lever that trades block granularity for this table's
+            # size. Only the candidate-source layer allocates it: a consumer layer
+            # (member is not None) folds nothing.
             block_table = torch.full(
                 (s, n_slots * n_local_blocks), -torch.inf, device=q.device, dtype=torch.float32
             )
@@ -1183,7 +1221,51 @@ class CompressedSparseAttention2(MegatronModule):
                             f"{_n_bad} of {_rows} rows differ, "
                             f"first differing rows={_bad}"
                         )
-                    elif f"L{self.layer_idx}" not in _check_reported:
+                    if fused[1] is not None:
+                        # The selection is not the whole contract: every later
+                        # Reindex layer ranks its candidate set from THIS layer's
+                        # block maxima, so a fold bug can leave the indices
+                        # bit-equal here while corrupting the next layer's
+                        # candidates. Compare the fold with the dense reduction
+                        # the dense candidate-source branch uses, bit-exactly.
+                        _f_block = fused[1]
+                        _dense_block = _dense_candidate_block_scores(
+                            _dense_scores,
+                            thd_layout,
+                            state.compressed_layout,
+                            self.config.csa2_candidate_block_size,
+                        )
+                        _same_shape = _f_block.shape == _dense_block.shape
+                        if not _same_shape or not bool(torch.equal(_f_block, _dense_block)):
+                            if _same_shape:
+                                # (-inf) - (-inf) is NaN even where both sides agree,
+                                # so the magnitude is taken only over the entries
+                                # that differ.
+                                _bad_block = _f_block != _dense_block
+                                _n_bad_block = int(_bad_block.any(dim=-1).sum())
+                                _block_diff = (_f_block - _dense_block).abs()
+                                _block_diff = torch.where(
+                                    _bad_block, _block_diff, torch.zeros_like(_block_diff)
+                                )
+                                _detail = (
+                                    f"{_n_bad_block} of {_f_block.shape[0]} rows differ, "
+                                    f"max|fused-dense|={float(_block_diff.max()):.6g}"
+                                )
+                            else:
+                                _detail = (
+                                    f"fused shape {tuple(_f_block.shape)} != dense shape "
+                                    f"{tuple(_dense_block.shape)}"
+                                )
+                            print(
+                                f"[FUSED-CHECK] layer={self.layer_idx} "
+                                f"BLOCK-SCORE MISMATCH: {_detail}",
+                                flush=True,
+                            )
+                            raise RuntimeError(
+                                f"CSA2_FUSED_CHECK: fused/dense block-score mismatch at "
+                                f"layer={self.layer_idx}: {_detail}"
+                            )
+                    if f"L{self.layer_idx}" not in _check_reported:
                         _check_reported.add(f"L{self.layer_idx}")
                         print(
                             f"[FUSED-CHECK] layer={self.layer_idx} EQUAL "
@@ -1226,26 +1308,17 @@ class CompressedSparseAttention2(MegatronModule):
                             self.config.csa2_candidate_block_size,
                         )
                     else:
-                        sequence_ids = thd_layout.sequence_ids.clamp_min(0)
-                        compressed = state.compressed_layout
-                        if scores.shape[-1]:
-                            # Reduce to per-block maxima in row chunks (see
-                            # _chunked_candidate_block_scores): the sequence-
-                            # local gather would materialize a second full-width
-                            # matrix beside the global score matrix.
-                            block_scores = _chunked_candidate_block_scores(
-                                scores.squeeze(0),
-                                sequence_ids,
-                                compressed,
-                                self.config.csa2_candidate_block_size,
-                            )
-                        else:
-                            num_blocks = -(
-                                -compressed.max_seqlen // self.config.csa2_candidate_block_size
-                            )
-                            block_scores = scores.new_full(
-                                (sequence_ids.shape[0], num_blocks), -torch.inf
-                            )
+                        # Reduce to per-block maxima (see
+                        # _chunked_candidate_block_scores): the sequence-local
+                        # gather would materialize a second full-width matrix
+                        # beside the global score matrix. The same helper backs
+                        # the CSA2_FUSED_CHECK cross-check below.
+                        block_scores = _dense_candidate_block_scores(
+                            scores,
+                            thd_layout,
+                            state.compressed_layout,
+                            self.config.csa2_candidate_block_size,
+                        )
                         visible = (thd_layout.position_ids + 1) // self.compress_ratio
                         state.candidates = candidate_blocks_from_block_scores(
                             block_scores.unsqueeze(0),
