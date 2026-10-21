@@ -22,10 +22,12 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
+    SinglePassMHCState,
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
 )
@@ -276,8 +278,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
+
+        if (
+            config.experimental_attention_variant == "dsv4_hybrid"
+            and config.dsv4_version == "v4.1"
+            and config.recompute_granularity == "full"
+        ):
+            raise NotImplementedError(
+                "CSA2 full recompute requires the stateful HybridStack execution path"
+            )
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -292,6 +304,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.name = name
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -362,12 +375,34 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 quantization_context = nullcontext()
 
             with quantization_context:
+                # Pass names so per-module recipes choose storage before TE allocates
+                # parameters. GPTModel's later finish_init() sets quantization overrides
+                # but does not replace existing weights: under global MXFP8 storage,
+                # even BF16-selected modules would otherwise get MXFP8 parameters.
+                # Loading a BF16 checkpoint into those parameters would quantize its
+                # values; converting back to BF16 cannot recover the lost precision.
+                # HybridStack already passes names during construction. Keep unnamed
+                # custom layer specs unchanged by omitting the extra keyword argument.
+                layer_kwargs = (
+                    {"name": f"{self.name}.layers.{layer_number - 1}"}
+                    if self.name is not None
+                    else {}
+                )
                 module = build_module(
                     layer_spec,
                     config=layer_config,
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+                    **layer_kwargs,
+                )
+            if layer_config.enable_mhc_connections and not getattr(
+                module, "supports_mhc_connections", False
+            ):
+                raise ValueError(
+                    f"{type(module).__name__} does not implement mHC residual streams. Build "
+                    "TransformerBlock with HyperConnectionTransformerLayer when "
+                    "enable_mhc_connections=True."
                 )
             return module
 
@@ -611,6 +646,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
 
+        shared_state_kwargs = {}
+        mhc_state = SinglePassMHCState() if self.config.mhc_single_pass else None
+        if mhc_state is not None:
+            shared_state_kwargs["mhc_state"] = mhc_state
+        if (
+            self.config.experimental_attention_variant == "dsv4_hybrid"
+            and self.config.dsv4_version == "v4.1"
+        ):
+            from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+
+            shared_state_kwargs["cross_layer_state"] = CSA2State()
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -683,6 +730,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states = checkpointed_result
             else:
                 for l_no, layer in enumerate(self.layers):
+                    residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
@@ -727,7 +775,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                             **extra_layer_kwargs,
+                            **shared_state_kwargs,
                         )
+                    observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,
@@ -747,8 +797,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Only contract if the final layer norm is in this stage
         if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
-            hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.mhc_num_residual_streams
+            hidden_states = (
+                mhc_state.contract(hidden_states, self.mhc_num_residual_streams)
+                if mhc_state is not None
+                else HyperConnectionModule.output_contract(
+                    hidden_states, self.mhc_num_residual_streams
+                )
             )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.

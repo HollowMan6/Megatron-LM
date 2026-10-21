@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,16 @@ def pytest_addoption(parser):
         action='store_true',
         help="pass that argument to enable experimental flag during testing (DEFAULT: False)",
     )
+
+
+def pytest_runtest_logreport(report):
+    if report.failed:
+        rank = os.environ.get("RANK", "?")
+        print(
+            f"\n[rank {rank}] {report.nodeid} ({report.when})\n" f"{report.longreprtext}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -130,3 +141,22 @@ def reset_env_vars():
     # After the test, restore the original environment
     os.environ.clear()
     os.environ.update(original_env)
+
+
+@pytest.fixture
+def te_rng_tracker(monkeypatch):
+    """Provide seeded graph-safe RNG without leaking MCore or TE tracker state."""
+    te_distributed = pytest.importorskip("transformer_engine.pytorch.distributed")
+    from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+    from megatron.core.tensor_parallel import random as rng
+
+    torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
+    previous = te_distributed.get_all_rng_states()
+    tracker = TECudaRNGStatesTracker()
+    monkeypatch.setattr(rng, "_CUDA_RNG_STATE_TRACKER", tracker)
+    monkeypatch.setattr(rng, "_CUDA_RNG_STATE_TRACKER_INITIALIZED", True)
+    try:
+        tracker.add(rng._MODEL_PARALLEL_RNG_TRACKER_NAME, 123)
+        yield tracker
+    finally:
+        te_distributed.set_all_rng_states(previous)

@@ -129,6 +129,23 @@ class TestCheckpointWithoutOutputManagerAPI:
         with pytest.raises(ValueError):
             manager.add_checkpoint(ckpt)
 
+    def test_frozen_checkpoint_is_retained_and_not_recomputed(self):
+        """A no-grad prefix may feed a later trainable operation."""
+        manager = CheckpointWithoutOutputManager()
+        frozen_input = torch.randn(4, 4, device='cuda')
+        frozen_output = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            lambda x: x * 2, frozen_input
+        )
+        trainable_weight = torch.randn(4, 4, device='cuda', requires_grad=True)
+        output = frozen_output @ trainable_weight
+
+        manager.discard_all_outputs_and_register_unified_recompute(output)
+
+        assert not frozen_output.requires_grad
+        assert frozen_output.untyped_storage().size() > 0
+        output.sum().backward()
+        assert trainable_weight.grad is not None
+
 
 class TestCheckpointManagerSequentialChain:
     """Test CheckpointWithoutOutputManager with sequential checkpoint chains."""
@@ -504,6 +521,25 @@ class TestTransformerBlockMHCRecompute:
         """TransformerBlock records static mHC recompute enablement during initialization."""
         block, _ = self._make_mhc_block(num_layers=2)
         assert block.mhc_recompute_enabled
+
+    def test_plain_transformer_layer_still_fails_fast_in_transformer_block(self):
+        """The Hybrid ownership exception must not weaken ordinary TransformerBlock wiring."""
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.transformer.transformer_block import TransformerBlock
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_mhc_connections=True,
+        )
+
+        with pytest.raises(ValueError, match="HyperConnectionTransformerLayer"):
+            TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
 
     def test_block_forward_input_expand_output_contract(self):
         """Forward exercises ``input_expand`` (pre) and ``output_contract`` (post)."""

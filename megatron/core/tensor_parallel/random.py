@@ -26,6 +26,7 @@ from megatron.core.parallel_state import (
     get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
 # ---------------------------------------------------------------------------
@@ -655,7 +656,7 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            with torch.enable_grad(), suspend_tensor_observations():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -705,7 +706,13 @@ def _save_args_to_ctx(ctx, args):
             continue
         non_tensor_entries.append((index, arg))
 
-    ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
+    # Save the raw tensors (as torch.utils.checkpoint does) rather than
+    # detach_variable()-ed copies: detaching here creates leaf tensors that require
+    # grad, and autograd's SavedVariable keeps such leaves alive until backward even
+    # when saved-tensor hooks (e.g. fine-grained activation offload) pack them away,
+    # pinning the input storage on GPU for the whole forward-backward interval.
+    # _load_args_from_ctx() detaches the unpacked tensors before they are reused.
+    ctx.save_for_backward(*tensor_args)
     ctx._non_tensor_entries = tuple(non_tensor_entries)
     ctx._total_args_count = len(args)
 
@@ -826,8 +833,7 @@ class CheckpointWithoutOutputManager:
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
         """Discard all checkpoint outputs to save memory and register unified recompute hook."""
         for ckpt in self.checkpoints:
-            for output in ckpt.outputs:
-                output.untyped_storage().resize_(0)
+            ckpt._discard_outputs()
 
         # Register unified recompute hook
         if hook_tensor.requires_grad:
@@ -854,7 +860,7 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False, ckpt_manager=None):
+    def __init__(self, fp8=False, ckpt_manager=None, retain_input_tensors=False):
         """
         Initialize CheckpointWithoutOutput.
 
@@ -872,9 +878,12 @@ class CheckpointWithoutOutput(object):
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
+            retain_input_tensors: Whether outputs sharing storage with checkpoint inputs
+                                  should be retained when discarding outputs.
         """
         self.fp8 = fp8 is not None
         self.ckpt_manager = ckpt_manager
+        self.retain_input_tensors = retain_input_tensors
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -901,10 +910,21 @@ class CheckpointWithoutOutput(object):
 
         self.rng_states = _get_all_rng_states()
 
+        if self.retain_input_tensors:
+            self._saved_input_ptrs = {
+                t.untyped_storage().data_ptr() for t in args if isinstance(t, torch.Tensor)
+            }
+
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
+        # A custom autograd.Function is not attached to the graph when none of
+        # its tensor inputs require gradients.  Such a checkpoint has no saved
+        # tensors and cannot be replayed, but its output can still feed a later
+        # trainable operation (for example, a frozen prefix before LoRA). Keep
+        # that output resident and exclude it from unified recomputation.
+        self._needs_recompute = any(output.requires_grad for output in self.outputs)
 
         # Auto-register to manager if provided
         if self.ckpt_manager is not None:
@@ -919,7 +939,7 @@ class CheckpointWithoutOutput(object):
 
         # The recomputation has been triggered already. Just return.
         # Handle cudagraphs: do nothing if currently in graph warmup
-        if self.ctx is None or is_graph_warmup():
+        if self.ctx is None or is_graph_warmup() or not self._needs_recompute:
             return
 
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
@@ -942,7 +962,7 @@ class CheckpointWithoutOutput(object):
 
             # Reconstruct full args list from saved ctx
             inputs = _load_args_from_ctx(self.ctx)
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
                 outputs = self.run_function(*inputs)
 
         self.run_function = None
@@ -958,12 +978,35 @@ class CheckpointWithoutOutput(object):
         #   - No tensor version-counter bump (no autograd complaint)
         share_storage = _get_share_storage()
         for output, recomputation_output in zip(self.outputs, outputs):
-            share_storage(output, recomputation_output)
+            if (
+                output.untyped_storage().data_ptr()
+                != recomputation_output.untyped_storage().data_ptr()
+            ):
+                share_storage(output, recomputation_output)
 
         self.ctx.outputs = outputs
         self.ctx.inputs = inputs
         self.outputs = None
         self.ctx = None
+
+    def _discard_outputs(self):
+        """Release output storage, preserving outputs that alias retained inputs."""
+        # Outputs from a checkpoint whose inputs did not require gradients are
+        # not represented by an autograd context and cannot be recomputed. They
+        # may nevertheless be consumed by a later trainable operation, so keep
+        # their storage for the forward/backward interval.
+        if not self._needs_recompute:
+            return
+        if self.retain_input_tensors:
+            # Skip outputs whose storage is shared with a saved input — freeing those
+            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
+            # operations with MakeExtraOutput).
+            for output in self.outputs:
+                if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
+                    output.untyped_storage().resize_(0)
+        else:
+            for output in self.outputs:
+                output.untyped_storage().resize_(0)
 
     def discard_output_and_register_recompute(self, hook_tensor):
         """
@@ -981,10 +1024,8 @@ class CheckpointWithoutOutput(object):
         if self.ckpt_manager is not None or is_graph_warmup():
             return
 
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
-        for output in self.outputs:
-            output.untyped_storage().resize_(0)
+        # Release output tensor memory while keeping metadata for backward.
+        self._discard_outputs()
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected

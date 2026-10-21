@@ -2,6 +2,7 @@
 
 import contextlib
 from functools import partial
+from itertools import chain
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
@@ -13,6 +14,11 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.pipeline_payload import (
+    PipelinePayload,
+    backward_pipeline_payload,
+)
+from megatron.core.pipeline_parallel.typed_p2p_communication import TypedP2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -48,6 +54,25 @@ except ImportError:
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _prepare_pipeline_payload_plans(
+    forward_step_func, data_iterators, models, num_microbatches, forward_only
+):
+    # Optional training-entry-point hook: stage data and host descriptors before
+    # any P2P is posted. The core schedule never interprets model/batch metadata.
+    prepare = getattr(forward_step_func, "prepare_pipeline_inputs", None)
+    if prepare is not None:
+        data_iterators = [
+            prepare(iterator, model, num_microbatches, forward_only=forward_only)
+            for iterator, model in zip(data_iterators, models)
+        ]
+    plans = [getattr(iterator, "pipeline_payload_plan", None) for iterator in data_iterators]
+    if all(plan is None for plan in plans):
+        return data_iterators, None
+    if any(plan is None or len(plan.incoming) != num_microbatches for plan in plans):
+        raise ValueError("Every typed pipeline chunk must plan every microbatch")
+    return data_iterators, plans
 
 
 def get_forward_backward_func(
@@ -183,6 +208,10 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     if (out is None) or (not deallocate_pipeline_outputs):
         return
 
+    if isinstance(out, PipelinePayload):
+        out.release_output()
+        return
+
     # Handle dict format (multi-module pipelines)
     if isinstance(out, dict):
         for value in out.values():
@@ -233,7 +262,7 @@ def custom_backward(output, grad_output):
     )
 
 
-def get_tensor_device(tensor: Union[torch.Tensor, Dict[str, torch.Tensor]]):
+def get_tensor_device(tensor: Union[torch.Tensor, PipelinePayload, Dict[str, torch.Tensor]]):
     """Get the device of a tensor or a dictionary of tensors."""
     if isinstance(tensor, dict):
         return next(iter(tensor.values())).device
@@ -282,7 +311,7 @@ def _get_experimental_attention_variant_loss_scale_func(config):
     if loss_scale_func is not None:
         return loss_scale_func
 
-    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
+    if getattr(config, 'experimental_attention_variant', None) in ('dsa', 'dsv4_hybrid'):
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             DSAIndexerLossAutoScaler,
         )
@@ -551,6 +580,16 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
 
+    # Typed P2P returns raw payloads and gradient tuples; all outputs share one backward.
+    if isinstance(input_tensor, PipelinePayload) or isinstance(output_tensor, PipelinePayload):
+        try:
+            return backward_pipeline_payload(
+                input_tensor, output_tensor, output_tensor_grad, config.grad_scale_func
+            )
+        finally:
+            if config.timers is not None:
+                config.timers('backward-compute').stop()
+
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
     if not isinstance(input_tensor, list):
@@ -709,6 +748,17 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
     return pg_collection
 
 
+def _reset_activation_offload(
+    pg_collection: Union[ProcessGroupCollection, MultiModuleProcessGroupCollection],
+) -> None:
+    """Reset activation offload state for single-model and MIMO language ranks."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        if not pg_collection.has_language_model():
+            return
+        pg_collection = pg_collection.get_language_model_collection()
+    off_interface.reset(process_group=pg_collection.tp_dp_cp)
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -860,7 +910,7 @@ def forward_backward_no_pipelining(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
     # Reset all_gather_pipeline bucket status before next validation iteration
     if forward_only:
         for model_chunk in [model]:
@@ -1069,6 +1119,46 @@ def forward_backward_pipelining_with_interleaving(
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
 
+    payload_factories = []
+    for chunk in model:
+        try:
+            payload_factories.append(get_attr_wrapped_model(chunk, "pipeline_payload_factory"))
+        except RuntimeError:
+            payload_factories.append(None)
+    typed_pipeline = any(factory is not None for factory in payload_factories)
+    if typed_pipeline:
+        if type(p2p_communicator) is not P2PCommunicator:
+            raise ValueError("Typed pipeline adapters cannot replace a custom P2P communicator")
+        if config.overlap_moe_expert_parallel_comm:
+            raise ValueError("Typed pipeline payloads do not support the combined MoE schedule")
+        # Include input preparation in the existing forward/backward timing;
+        # moving batch work out of the hot loop must not hide its cost.
+        if config.timers is not None:
+            config.timers('forward-backward', log_level=1).start(
+                barrier=config.barrier_with_L1_time
+            )
+        data_iterator, payload_plans = _prepare_pipeline_payload_plans(
+            forward_step_func, data_iterator, model, num_microbatches, forward_only
+        )
+        first_parameter = next(model[0].parameters(), None)
+        p2p_communicator = TypedP2PCommunicator(
+            pg_collection.pp,
+            config,
+            payload_factories,
+            forward_only=forward_only,
+            device=first_parameter.device if first_parameter is not None else None,
+            payload_plans=payload_plans,
+            control_group=get_attr_wrapped_model(model[0], "pipeline_control_group"),
+        )
+    # Typed P2P releases payload references when posting the send; it retains the
+    # detached wire buffers itself. Do not pseudo-deallocate its terminal scalar loss.
+    deallocate_pipeline_outputs = config.deallocate_pipeline_outputs and not typed_pipeline
+
+    def communication_chunk_ids(**chunk_ids):
+        # Legacy tensor communicators keep their existing interface. Typed P2P
+        # needs independent IDs for every active direction of a compound call.
+        return chunk_ids if typed_pipeline else {}
+
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
 
@@ -1082,7 +1172,7 @@ def forward_backward_pipelining_with_interleaving(
             config, model, is_pp_last_stage(p2p_communicator.pp_group)
         )
 
-    if config.timers is not None:
+    if config.timers is not None and not typed_pipeline:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     # Disable async grad reductions
@@ -1134,7 +1224,9 @@ def forward_backward_pipelining_with_interleaving(
 
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
-    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    total_num_tokens = torch.zeros(
+        [], dtype=torch.int, device=p2p_communicator.device if typed_pipeline else "cuda"
+    )
 
     forward_data_store = []
     output_tensor_grads = None
@@ -1353,6 +1445,9 @@ def forward_backward_pipelining_with_interleaving(
         # microbatch_id offset with number of released microbatches that have completed backprop.
         offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
         input_tensor = input_tensors[model_chunk_id][microbatch_id - offset]
+        if typed_pipeline:
+            input_tensor = p2p_communicator.resolve_forward(input_tensor)
+            input_tensors[model_chunk_id][microbatch_id - offset] = input_tensor
 
         return input_tensor
 
@@ -1593,6 +1688,7 @@ def forward_backward_pipelining_with_interleaving(
                     recv_prev=recv_prev,
                     tensor_shape=tensor_shape,
                     overlap_p2p_comm=True,
+                    **communication_chunk_ids(recv_chunk_id=next_forward_model_chunk_id),
                 )
             )
 
@@ -1637,21 +1733,35 @@ def forward_backward_pipelining_with_interleaving(
                         recv_prev=recv_prev,
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
+                        **communication_chunk_ids(
+                            forward_send_chunk_id=cur_model_chunk_id,
+                            forward_recv_chunk_id=next_forward_model_chunk_id,
+                            backward_recv_chunk_id=num_model_chunks - 1,
+                        ),
                     )
                 )
                 output_tensor_grads[num_model_chunks - 1].append(output_tensor_grad)
             else:
                 input_tensor = p2p_communicator.send_forward_recv_forward(
-                    output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape
+                    output_tensor,
+                    recv_prev=recv_prev,
+                    tensor_shape=tensor_shape,
+                    **communication_chunk_ids(
+                        send_chunk_id=cur_model_chunk_id, recv_chunk_id=next_forward_model_chunk_id
+                    ),
                 )
             if recv_prev:
                 input_tensors[next_forward_model_chunk_id].append(input_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
         else:
             if not is_pp_first_stage(p2p_communicator.pp_group):
                 # Send only since recv prefetched.
                 _, fwd_wait_handles = p2p_communicator.send_forward_recv_forward(
-                    output_tensor, recv_prev=False, tensor_shape=tensor_shape, overlap_p2p_comm=True
+                    output_tensor,
+                    recv_prev=False,
+                    tensor_shape=tensor_shape,
+                    overlap_p2p_comm=True,
+                    **communication_chunk_ids(send_chunk_id=cur_model_chunk_id),
                 )
             else:  # No prefetch for first rank, so both send and recv initiated.
                 fwd_recv_buffer[k % fwd_recv_buffer_size], fwd_wait_handles = (
@@ -1660,6 +1770,10 @@ def forward_backward_pipelining_with_interleaving(
                         recv_prev=recv_prev,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        **communication_chunk_ids(
+                            send_chunk_id=cur_model_chunk_id,
+                            recv_chunk_id=next_forward_model_chunk_id,
+                        ),
                     )
                 )
             if send_next_wait_handle is not None:
@@ -1672,11 +1786,11 @@ def forward_backward_pipelining_with_interleaving(
                     recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
             # isend() copies asynchronously; wait until the copy is done before
             # freeing the source buffer, otherwise the next PP stage gets corrupted data.
-            if send_next_wait_handle is not None and config.deallocate_pipeline_outputs:
+            if send_next_wait_handle is not None and deallocate_pipeline_outputs:
                 send_next_wait_handle.wait()
                 send_next_wait_handle = None
 
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
             if recv_prev:
                 input_tensors[next_forward_model_chunk_id].append(
                     fwd_recv_buffer[k % fwd_recv_buffer_size]
@@ -1700,6 +1814,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        **communication_chunk_ids(recv_chunk_id=num_model_chunks - 1),
                     )
                 )
                 if send_prev_wait_handle is not None:
@@ -1754,7 +1869,7 @@ def forward_backward_pipelining_with_interleaving(
                             recv_prev_wait_handle = recv_prev_wait_handles.pop(0)
                             recv_prev_wait_handle.wait()
 
-                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
             # Async forward send / receive
             def pp_post_forward(output_tensor, vp_stage=None):
@@ -1785,6 +1900,9 @@ def forward_backward_pipelining_with_interleaving(
                         recv_prev=recv_prev,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        **communication_chunk_ids(
+                            send_chunk_id=vp_stage, recv_chunk_id=next_forward_model_chunk_id
+                        ),
                     )
                 )
                 if send_next_wait_handle is not None:
@@ -1799,7 +1917,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
                 # isend() copies asynchronously; wait until the copy is done before
                 # freeing the source buffer, otherwise the next PP stage gets corrupted data.
-                if send_next_wait_handle is not None and config.deallocate_pipeline_outputs:
+                if send_next_wait_handle is not None and deallocate_pipeline_outputs:
                     send_next_wait_handle.wait()
                     send_next_wait_handle = None
                 # assert fwd_wait_handles is not None
@@ -1853,6 +1971,9 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        **communication_chunk_ids(
+                            send_chunk_id=vp_stage, recv_chunk_id=next_backward_model_chunk_id
+                        ),
                     )
                 )
                 if send_prev_wait_handle is not None:
@@ -1927,9 +2048,15 @@ def forward_backward_pipelining_with_interleaving(
                     recv_prev=recv_prev,
                     recv_next=recv_next,
                     tensor_shape=tensor_shape,
+                    **communication_chunk_ids(
+                        forward_send_chunk_id=forward_model_chunk_id,
+                        backward_send_chunk_id=backward_model_chunk_id,
+                        forward_recv_chunk_id=next_forward_model_chunk_id,
+                        backward_recv_chunk_id=next_backward_model_chunk_id,
+                    ),
                 )
             )
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
             # Put input_tensor and output_tensor_grad in data structures in the
             # right location.
             if recv_prev:
@@ -1937,7 +2064,7 @@ def forward_backward_pipelining_with_interleaving(
             if recv_next:
                 output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
 
-    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+    deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
     nvtx_range_pop(suffix="steady")
 
     # Run cooldown backward passes (flush out pipeline) for the last model chunk.
@@ -1955,6 +2082,7 @@ def forward_backward_pipelining_with_interleaving(
                     is_last_stage=(
                         _is_vp_last_stage(vp_stage=curr_vp_stage) and is_pp_last_stage(pp_group)
                     ),
+                    **communication_chunk_ids(recv_chunk_id=curr_vp_stage),
                 )
             )
         for k in range(num_microbatches_remaining, total_num_microbatches):
@@ -1992,6 +2120,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        **communication_chunk_ids(recv_chunk_id=next_backward_model_chunk_id),
                     )
                 )
 
@@ -2011,6 +2140,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next=False,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        **communication_chunk_ids(send_chunk_id=cur_model_chunk_id),
                     )
                 else:
                     bwd_recv_buffer[k % bwd_recv_buffer_size], bwd_wait_handles = (
@@ -2019,6 +2149,10 @@ def forward_backward_pipelining_with_interleaving(
                             recv_next=recv_next,
                             tensor_shape=tensor_shape,
                             overlap_p2p_comm=True,
+                            **communication_chunk_ids(
+                                send_chunk_id=cur_model_chunk_id,
+                                recv_chunk_id=next_backward_model_chunk_id,
+                            ),
                         )
                     )
 
@@ -2040,7 +2174,12 @@ def forward_backward_pipelining_with_interleaving(
 
             else:
                 output_tensor_grad = p2p_communicator.send_backward_recv_backward(
-                    input_tensor_grad, recv_next=recv_next, tensor_shape=tensor_shape
+                    input_tensor_grad,
+                    recv_next=recv_next,
+                    tensor_shape=tensor_shape,
+                    **communication_chunk_ids(
+                        send_chunk_id=cur_model_chunk_id, recv_chunk_id=next_backward_model_chunk_id
+                    ),
                 )
 
                 if recv_next:
@@ -2066,6 +2205,10 @@ def forward_backward_pipelining_with_interleaving(
         not recv_next_wait_handles
     ), 'recv_next_wait_handles should be cleared at the end of a step'
 
+    if typed_pipeline:
+        # Retire the last asynchronous sends before final gradient collectives.
+        p2p_communicator.finish()
+
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
@@ -2086,7 +2229,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2133,6 +2276,18 @@ def get_tensor_shapes(
     return tensor_shapes
 
 
+def _prepare_forward_data_iterator(data_iterator, p2p_communicator, *, is_multimodule: bool):
+    """Prepare a batch-derived bridge shape without advancing the logical batch."""
+    if not is_multimodule or not p2p_communicator.has_receiver_derived_bridge_shapes:
+        return data_iterator
+    if data_iterator is None:
+        raise RuntimeError("batch-derived bridge shapes require a data iterator")
+
+    batch = next(data_iterator)
+    p2p_communicator.prepare_bridge_recv_shapes(batch)
+    return chain((batch,), data_iterator)
+
+
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -2165,7 +2320,6 @@ def forward_backward_pipelining_without_interleaving(
             len(data_iterator) == 1
         ), "non-interleaved pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
-
     config = get_model_config(model)
     if config.overlap_p2p_comm:
         raise ValueError(
@@ -2221,13 +2375,50 @@ def forward_backward_pipelining_without_interleaving(
     else:
         raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
 
+    try:
+        payload_factory = get_attr_wrapped_model(model, "pipeline_payload_factory")
+    except RuntimeError:
+        payload_factory = None
+    if payload_factory is not None:
+        if type(p2p_communicator) is not P2PCommunicator:
+            raise ValueError("Typed pipeline adapters cannot replace a custom P2P communicator")
+        if is_multimodule or adjust_tensor_shapes_fn is not None:
+            raise ValueError(
+                "Typed pipeline payloads require a single module and their own tensor descriptors"
+            )
+        # This runtime owns only this invocation's FIFO descriptors. Model
+        # adapters keep static plans, never communication queues.
+        if config.timers is not None:
+            config.timers('forward-backward', log_level=1).start(
+                barrier=config.barrier_with_L1_time
+            )
+        prepared_iterators, payload_plans = _prepare_pipeline_payload_plans(
+            forward_step_func, [data_iterator], [model], num_microbatches, forward_only
+        )
+        data_iterator = prepared_iterators[0]
+        first_parameter = next(model.parameters(), None)
+        p2p_communicator = TypedP2PCommunicator(
+            pg_collection.pp,
+            config,
+            payload_factory,
+            forward_only=forward_only,
+            device=first_parameter.device if first_parameter is not None else None,
+            payload_plans=payload_plans,
+            control_group=get_attr_wrapped_model(model, "pipeline_control_group"),
+        )
+    # Typed P2P owns payload release, including asynchronous send-buffer lifetimes.
+    deallocate_pipeline_outputs = config.deallocate_pipeline_outputs and payload_factory is None
+
+    if is_multimodule:
+        p2p_communicator.set_forward_only(forward_only)
+
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         embedding_module = clear_embedding_activation_buffer(
             config, model, p2p_communicator.is_pp_last_stage
         )
 
-    if config.timers is not None:
+    if config.timers is not None and payload_factory is None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     if getattr(config, "moe_paged_stash", False):
@@ -2254,6 +2445,13 @@ def forward_backward_pipelining_without_interleaving(
             no_sync_context = None
 
     disable_grad_sync()
+
+    grad_sync_first_stage = p2p_communicator.is_pp_first_stage
+    if isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+        grad_sync_first_stage = all(
+            p2p_communicator.is_module_pp_first_stage(module_name)
+            for module_name in p2p_communicator.rank_module_map
+        )
 
     # Compute number of warmup microbatches.
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
@@ -2305,7 +2503,8 @@ def forward_backward_pipelining_without_interleaving(
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
-    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    token_device = p2p_communicator.device if payload_factory is not None else "cuda"
+    total_num_tokens = torch.zeros([], dtype=torch.int, device=token_device)
 
     if not forward_only:
         input_tensors = []
@@ -2323,12 +2522,15 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        forward_data_iterator = _prepare_forward_data_iterator(
+            data_iterator, p2p_communicator, is_multimodule=is_multimodule
+        )
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
-            data_iterator,
+            forward_data_iterator,
             model,
             num_microbatches,
             input_tensor,
@@ -2347,12 +2549,15 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
+        forward_data_iterator = _prepare_forward_data_iterator(
+            data_iterator, p2p_communicator, is_multimodule=is_multimodule
+        )
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
@@ -2371,7 +2576,7 @@ def forward_backward_pipelining_without_interleaving(
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,
-            data_iterator,
+            forward_data_iterator,
             model,
             num_microbatches,
             input_tensor,
@@ -2391,6 +2596,9 @@ def forward_backward_pipelining_without_interleaving(
         if forward_only:
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
+                forward_data_iterator = _prepare_forward_data_iterator(
+                    data_iterator, p2p_communicator, is_multimodule=is_multimodule
+                )
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
@@ -2402,7 +2610,7 @@ def forward_backward_pipelining_without_interleaving(
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
@@ -2412,7 +2620,7 @@ def forward_backward_pipelining_without_interleaving(
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
             if num_warmup_microbatches == 0 and last_iteration:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
             input_tensor_grad = backward_func(
@@ -2425,6 +2633,9 @@ def forward_backward_pipelining_without_interleaving(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
             else:
+                forward_data_iterator = _prepare_forward_data_iterator(
+                    data_iterator, p2p_communicator, is_multimodule=is_multimodule
+                )
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
@@ -2439,7 +2650,7 @@ def forward_backward_pipelining_without_interleaving(
             # pipeline stages do grad reduction during pipeline
             # bubble.
             if i == num_warmup_microbatches - 1:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
             input_tensor = input_tensors.pop(0)
@@ -2461,6 +2672,9 @@ def forward_backward_pipelining_without_interleaving(
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
 
+    if payload_factory is not None:
+        p2p_communicator.finish()
+
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
@@ -2480,7 +2694,7 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

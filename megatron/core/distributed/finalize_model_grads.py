@@ -6,6 +6,10 @@ from typing import Callable, Dict, List, Optional, Union
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    uneven_dtensor_to_full_tensor,
+)
+
 try:
     from torch.distributed._tensor import DTensor, distribute_tensor
 
@@ -201,6 +205,35 @@ def _allreduce_word_embedding_grads(
     )
 
 
+def _full_embedding_grad(orig_grad):
+    """Expand an MFSDP v2 uneven (flat-buffer) sharded embedding grad to the full logical gradient.
+
+    MFSDP v2 shards the shared word embedding with uneven (flat-buffer) offsets, and different
+    PP stages can hold the same logical slice at different flat-buffer offsets with different local
+    shard shapes. ``uneven_dtensor_to_full_tensor`` gathers each rank's chunk metadata and local
+    buffer and reconstructs the full logical gradient in a canonical (uniform-row) layout so that
+    position ``i`` denotes the same logical element on every rank; only then can a cross-stage
+    all-reduce combine matching elements.
+    """
+    return uneven_dtensor_to_full_tensor(orig_grad) if orig_grad is not None else None
+
+
+def _copy_embedding_grad_back(orig_grad, full_grad):
+    """Copy this rank's logical slice from the full gradient back into its shard's local tensor.
+
+    After the all-reduce, ``full_grad`` holds the accumulated logical gradient in canonical layout.
+    Each rank owns a contiguous slice (the chunk ``orig_grad.__create_chunk_list__()[0]``) in its
+    own flattened shard, located by ``offsets``/``sizes``; copying that slice back into
+    ``orig_grad._local_tensor`` restores the stage's local shard without changing the (identical)
+    contents on other ranks.
+    """
+    chunk = orig_grad.__create_chunk_list__()[0]
+    local_slice = tuple(
+        slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
+    )
+    orig_grad._local_tensor.copy_(full_grad[local_slice])
+
+
 def _allreduce_embedding_grad(
     model: List[torch.nn.Module],
     embd_group: torch.distributed.ProcessGroup,
@@ -250,13 +283,19 @@ def _allreduce_embedding_grad(
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
-            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
-        grad = _unshard_if_dtensor(orig_grad)
+            # Expand the uneven (flat-buffer) sharded embedding grad to the full logical gradient
+            # so the cross-stage all-reduce below combines matching rows (see _full_embedding_grad).
+            grad = _full_embedding_grad(orig_grad)
+        else:
+            grad = _unshard_if_dtensor(orig_grad)
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
-        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+        if ddp_config.use_megatron_fsdp:
+            _copy_embedding_grad_back(orig_grad, grad)
+        else:
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def _allreduce_position_embedding_grads(
@@ -319,7 +358,11 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias'):
+            if (
+                config.moe_router_enable_expert_bias
+                and hasattr(module, 'expert_bias')
+                and module.expert_bias is not None
+            ):
                 module.local_tokens_per_expert.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
@@ -351,6 +394,7 @@ def _update_router_expert_bias(
             if (
                 hasattr(module, 'expert_bias')
                 and module.training
+                and module.expert_bias is not None
                 and not getattr(module, 'frozen_expert_bias', False)
             ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
@@ -358,17 +402,21 @@ def _update_router_expert_bias(
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return
-    stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
-    stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert,
-        stacked_expert_bias,
-        config.moe_router_bias_update_rate,
-        tp_dp_cp_group=tp_dp_cp_group,
-    )
-
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    # Backbone and draft networks may use different numbers of routed experts.
+    # Batch only compatible vectors, preserving a deterministic collective order.
+    groups = {}
+    for counts, bias in zip(tokens_per_expert_list, expert_bias_list):
+        groups.setdefault(tuple(bias.shape), []).append((counts, bias))
+    for shape in sorted(groups):
+        entries = groups[shape]
+        updated = get_updated_expert_bias(
+            torch.stack([counts for counts, _ in entries]),
+            torch.stack([bias for _, bias in entries]),
+            config.moe_router_bias_update_rate,
+            tp_dp_cp_group=tp_dp_cp_group,
+        )
+        for (_, bias), value in zip(entries, updated):
+            bias.copy_(value)
 
 
 def _update_router_qb_beta(
