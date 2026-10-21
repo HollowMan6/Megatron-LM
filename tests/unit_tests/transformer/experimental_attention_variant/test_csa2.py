@@ -494,10 +494,9 @@ def test_thd_cp_indexer_loss_matches_unsplit(ratio, per_token, sparse):
         # reduce_group stays empty because the saved value is a token mean in both
         # reduction modes (unlike the DSA line, which SUMs in per-token mode).
         assert tracker["avg_group"] is not None
-        assert (
-            torch.distributed.get_process_group_ranks(tracker["avg_group"])
-            == torch.distributed.get_process_group_ranks(groups.cp)
-        )
+        assert torch.distributed.get_process_group_ranks(
+            tracker["avg_group"]
+        ) == torch.distributed.get_process_group_ranks(groups.cp)
         assert tracker["reduce_group"] is None
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             distributed_layer.core_attention.pg_collection
@@ -1297,12 +1296,8 @@ def test_chunked_candidate_block_scores_match_full_gather(monkeypatch):
 
     # The reduced form feeds the same ranking as the full-matrix path.
     visible = torch.randint(1, max_seqlen + 1, (1, rows, 1), device="cuda")
-    from_blocks = candidate_blocks_from_block_scores(
-        chunked.unsqueeze(0), visible, 2, block_size
-    )
-    from_full = candidate_blocks_from_scores(
-        full_local.unsqueeze(0), visible, 2, block_size
-    )
+    from_blocks = candidate_blocks_from_block_scores(chunked.unsqueeze(0), visible, 2, block_size)
+    from_full = candidate_blocks_from_scores(full_local.unsqueeze(0), visible, 2, block_size)
     torch.testing.assert_close(from_blocks.indices, from_full.indices)
 
 
@@ -1320,7 +1315,13 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
 
     import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
 
-    torch.manual_seed(101)
+    # A dedicated generator instead of torch.manual_seed(): seeding here would reset
+    # the process-wide CUDA stream that earlier tests in this file already advanced,
+    # so the draws below would depend on test order and would perturb whatever runs
+    # next. A fresh CUDA generator seeded 101 reproduces the same draws and leaves
+    # global RNG state untouched.
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(101)
     ratio, topk, block_size = 2, 8, 8
 
     @dataclasses.dataclass
@@ -1344,9 +1345,7 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     rows_seq = torch.cat(
         [torch.full((n,), i, dtype=torch.int64, device="cuda") for i, n in enumerate(row_counts)]
     )
-    rows_pos = torch.cat(
-        [torch.arange(n, dtype=torch.int64, device="cuda") for n in row_counts]
-    )
+    rows_pos = torch.cat([torch.arange(n, dtype=torch.int64, device="cuda") for n in row_counts])
     rows_valid = torch.ones(s, dtype=torch.bool, device="cuda")
     rows_valid[-5:] = False  # padding tail: all-masked -> -1 sentinel rows
     cu = torch.zeros(4, dtype=torch.int64, device="cuda")
@@ -1365,10 +1364,10 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     comp = _Compressed(cu, max(capacities), valid_groups, key_seq, key_pos)
 
     h, d = 4, 32
-    q = torch.randn(s, 1, h, d, device="cuda")
-    indexer_k = torch.randn(keys, 1, d, device="cuda")
+    q = torch.randn(s, 1, h, d, device="cuda", generator=gen)
+    indexer_k = torch.randn(keys, 1, d, device="cuda", generator=gen)
     indexer_k[: keys // 2].neg_()  # ReLU emits exact zeros: the tie-storm regime
-    weights = torch.randn(s, 1, h, device="cuda")
+    weights = torch.randn(s, 1, h, device="cuda", generator=gen)
 
     # Dense reference: the forward_before_topk no-grad THD math, verbatim.
     scores = csa2_module._chunked_csa2_indexer_scores(q, indexer_k, weights)
@@ -1382,20 +1381,16 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     k = min(topk, scores.shape[-1])
     winners = scores.reshape(-1, scores.shape[-1]).argsort(dim=-1, descending=True, stable=True)
     ref_indices = winners[..., :k].sort(dim=-1).values.reshape(1, s, k)
-    ref_indices = ref_indices.masked_fill(
-        ~scores.gather(-1, ref_indices).isfinite(), -1
-    ).int()
+    ref_indices = ref_indices.masked_fill(~scores.gather(-1, ref_indices).isfinite(), -1).int()
     ref_blocks = csa2_module._chunked_candidate_block_scores(
         scores.squeeze(0), thd.sequence_ids.clamp_min(0), comp, block_size
     )
 
     # Candidate mask case: random per-row candidate blocks.
-    ids = torch.randint(0, 4, (1, s, 3), dtype=torch.int32, device="cuda")
+    ids = torch.randint(0, 4, (1, s, 3), dtype=torch.int32, device="cuda", generator=gen)
     ids[0, -5:] = -1  # padding rows have no candidates
     cand = CSA2CandidateBlocks(ids, block_size)
-    cand_mask = cand.to_mask_thd(
-        thd.sequence_ids, comp.sequence_ids, comp.position_ids // ratio
-    )
+    cand_mask = cand.to_mask_thd(thd.sequence_ids, comp.sequence_ids, comp.position_ids // ratio)
     scores_c = scores.masked_fill(~cand_mask, -torch.inf)
     winners_c = scores_c.reshape(-1, scores_c.shape[-1]).argsort(
         dim=-1, descending=True, stable=True
@@ -1437,10 +1432,10 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     # trailing invalid groups: the last 5 groups are padding
     solo_valid_groups = torch.ones(solo_capacity, dtype=torch.bool, device="cuda")
     solo_valid_groups[-5:] = False
-    solo_comp = _Compressed(
-        solo_cu, solo_capacity, solo_valid_groups, solo_key_seq, solo_key_pos
+    solo_comp = _Compressed(solo_cu, solo_capacity, solo_valid_groups, solo_key_seq, solo_key_pos)
+    solo_scores = csa2_module._chunked_csa2_indexer_scores(
+        q[:solo_rows], indexer_k[:solo_capacity], weights[:solo_rows]
     )
-    solo_scores = csa2_module._chunked_csa2_indexer_scores(q[:solo_rows], indexer_k[:solo_capacity], weights[:solo_rows])
     solo_causal = (
         solo_thd.valid_tokens[:, None]
         & solo_comp.valid_groups[None, :]
@@ -1454,9 +1449,7 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
         .sort(dim=-1)
         .values.reshape(1, solo_rows, k)
     )
-    solo_ref = solo_winners.masked_fill(
-        ~solo_scores.gather(-1, solo_winners).isfinite(), -1
-    ).int()
+    solo_ref = solo_winners.masked_fill(~solo_scores.gather(-1, solo_winners).isfinite(), -1).int()
     solo_got, _ = csa2_module._streaming_indexer_topk(
         q[:solo_rows],
         indexer_k[:solo_capacity],
@@ -1475,7 +1468,7 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     #     the skip form must match the already-verified candidate select.
     # Give rows disjoint candidate blocks so live tiles are sparse and
     # interleaved (some 64-key tiles fully dead, some live).
-    sparse_ids = torch.randint(0, 4, (1, s, 2), dtype=torch.int32, device="cuda")
+    sparse_ids = torch.randint(0, 4, (1, s, 2), dtype=torch.int32, device="cuda", generator=gen)
     sparse_ids[0, -5:] = -1
     sparse_cand = CSA2CandidateBlocks(sparse_ids, block_size)
     dense_skip_got, _ = csa2_module._streaming_indexer_topk(
@@ -1535,6 +1528,107 @@ def test_streaming_topk_matches_dense_thd(monkeypatch):
     )
     assert none_got.shape == (1, s, k) and none_got.dtype == torch.int32
     assert (none_got == -1).all()
+
+
+def test_streaming_block_scores_fold_causal_maxima_with_a_candidate_set():
+    """want_block_scores folds the causal maxima even when candidates are supplied.
+
+    The candidate-source layer derives its block set from these maxima, so on the
+    dense path they come from forward_before_topk's causally masked scores, with
+    _chunked_candidate_block_scores as the pinned oracle. The module never reaches
+    this combination on its own (the candidate source does not consume candidates),
+    so this test drives it directly: one candidate set exercises both halves of the
+    split, namely folding before the membership mask (a candidate-excluded block
+    whose keys are still causally scorable keeps its causal maximum) and staging the
+    tiles a candidate-only skip would call dead. The selection must still honor the
+    candidate mask.
+    """
+    import dataclasses
+
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(202)
+    ratio, topk, block_size = 2, 8, 8
+
+    @dataclasses.dataclass
+    class _Thd:
+        valid_tokens: torch.Tensor
+        sequence_ids: torch.Tensor
+        position_ids: torch.Tensor
+
+    @dataclasses.dataclass
+    class _Compressed:
+        cu_seqlens_padded: torch.Tensor
+        max_seqlen: int
+        valid_groups: torch.Tensor
+        sequence_ids: torch.Tensor
+        position_ids: torch.Tensor
+
+    row_counts = [96, 40]
+    capacities = [48, 24]  # compressed groups per sequence
+    s = sum(row_counts)
+    rows_seq = torch.cat(
+        [torch.full((n,), i, dtype=torch.int64, device="cuda") for i, n in enumerate(row_counts)]
+    )
+    rows_pos = torch.cat([torch.arange(n, dtype=torch.int64, device="cuda") for n in row_counts])
+    cu = torch.zeros(len(capacities) + 1, dtype=torch.int64, device="cuda")
+    cu[1:] = torch.tensor(capacities, device="cuda").cumsum(0)
+    keys = int(cu[-1])
+    key_seq = torch.cat(
+        [torch.full((c,), i, dtype=torch.int64, device="cuda") for i, c in enumerate(capacities)]
+    )
+    key_pos = torch.cat(
+        [torch.arange(c, dtype=torch.int64, device="cuda") * ratio for c in capacities]
+    )
+    thd = _Thd(torch.ones(s, dtype=torch.bool, device="cuda"), rows_seq, rows_pos)
+    comp = _Compressed(
+        cu, max(capacities), torch.ones(keys, dtype=torch.bool, device="cuda"), key_seq, key_pos
+    )
+
+    h, d = 4, 32
+    q = torch.randn(s, 1, h, d, device="cuda", generator=gen)
+    indexer_k = torch.randn(keys, 1, d, device="cuda", generator=gen)
+    weights = torch.randn(s, 1, h, device="cuda", generator=gen)
+
+    # Dense reference: the forward_before_topk no-grad THD math, verbatim.
+    scores = csa2_module._chunked_csa2_indexer_scores(q, indexer_k, weights)
+    causal = (
+        thd.valid_tokens[:, None]
+        & comp.valid_groups[None, :]
+        & (thd.sequence_ids[:, None] == comp.sequence_ids[None, :])
+        & (comp.position_ids[None, :] + ratio <= thd.position_ids[:, None] + 1)
+    )
+    scores = scores.masked_fill(~causal, -torch.inf)
+    k = min(topk, keys)
+    ref_blocks = csa2_module._chunked_candidate_block_scores(
+        scores.squeeze(0), thd.sequence_ids.clamp_min(0), comp, block_size
+    )
+
+    # Sequence 0 rows drop block 1: its keys stay causally scorable, so the causal
+    # maximum differs from the candidate-masked one. Sequence 1 rows drop block 2,
+    # the only block with keys (64..71) in the second 64-key tile, so a candidate
+    # skip alone would call that tile dead while the causal fold still needs it.
+    ids = torch.full((1, s, 3), -1, dtype=torch.int32, device="cuda")
+    ids[0, : row_counts[0], :3] = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
+    ids[0, row_counts[0] :, :2] = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    cand = CSA2CandidateBlocks(ids, block_size)
+    cand_mask = cand.to_mask_thd(thd.sequence_ids, comp.sequence_ids, comp.position_ids // ratio)
+    scores_c = scores.masked_fill(~cand_mask, -torch.inf)
+    winners_c = scores_c.reshape(-1, keys).argsort(dim=-1, descending=True, stable=True)
+    ref_c = winners_c[..., :k].sort(dim=-1).values.reshape(1, s, k)
+    ref_c = ref_c.masked_fill(~scores_c.gather(-1, ref_c).isfinite(), -1).int()
+    # The fixture is only discriminating if the candidate mask moves some maxima.
+    candidate_masked_blocks = csa2_module._chunked_candidate_block_scores(
+        scores_c.squeeze(0), thd.sequence_ids.clamp_min(0), comp, block_size
+    )
+    assert not torch.equal(candidate_masked_blocks, ref_blocks)
+
+    got_indices, got_blocks = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, cand, True, block_size
+    )
+    torch.testing.assert_close(got_blocks, ref_blocks, rtol=0, atol=0)
+    torch.testing.assert_close(got_indices, ref_c, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("width", [0, 1, 3, 17, 1025])
