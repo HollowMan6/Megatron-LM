@@ -1491,9 +1491,6 @@ class CompressedSparseAttention2(MegatronModule):
             indices = torch.cat((indices, global_indices), dim=-1)
         # Gather in FP32 so repeated KV positions also accumulate their backward contributions
         # in FP32. Casting after the gather would scatter-add those gradients in BF16.
-        # Only 'none' and 'cudnn' reach here: validate_csa2_config rejects other backends,
-        # and the TileLang branch this used to carry imported .ops.tilelang_csa_sparse_mla,
-        # an adapter that is not in this tree.
         if self.config.dsa_kernel_backend == "cudnn":
             flat_indices, lengths = fused_sparse_attention.build_flat_topk_idxs(
                 indices, batch_size=batch, compact=True
@@ -1501,6 +1498,19 @@ class CompressedSparseAttention2(MegatronModule):
             output = fused_sparse_attention.csa_sparse_attn(
                 query, kv, self.attn_sink, flat_indices, self.softmax_scale, topk_length=lengths
             )
+        elif self.config.dsa_kernel_backend == "tilelang":
+            from .ops.tilelang_csa_sparse_mla import tilelang_csa_sparse_attn
+
+            # The adapter returns None when the fused kernels cannot serve this
+            # shape (head count, dtype, empty top-k); the reference path then
+            # keeps the model running instead of failing it.
+            output = tilelang_csa_sparse_attn(
+                query, kv, self.attn_sink, indices, self.softmax_scale
+            )
+            if output is None:
+                output = unfused_compressed_sparse_attn(
+                    query, kv.float(), self.attn_sink, indices, self.softmax_scale
+                )
         else:
             output = unfused_compressed_sparse_attn(
                 query, kv.float(), self.attn_sink, indices, self.softmax_scale

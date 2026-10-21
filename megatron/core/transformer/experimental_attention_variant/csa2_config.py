@@ -7,6 +7,33 @@ import math
 import torch
 
 
+def _validate_tilelang_backend_dependencies() -> None:
+    """Fail fast when the CSA2 TileLang sparse-MLA kernels cannot run here.
+
+    Importing the runtime is not the same as having the kernels: the adapter's own
+    guard tolerates a missing shared object or a failed import, in which case it
+    reports the backend as unavailable and every forward silently takes the
+    reference path. Checking the adapter's availability flag makes the configured
+    backend a promise instead of a hope.
+    """
+    try:
+        from .ops.tilelang_csa_sparse_mla import _HAVE_TILELANG_SPARSE_MLA
+    except (ImportError, OSError) as exc:  # missing runtime, missing kernel .so
+        raise ImportError(
+            "dsa_kernel_backend='tilelang' requires the CSA2 sparse-MLA adapter, which "
+            f"could not be imported: {exc}. Install TileLang with its TVM FFI runtime, or "
+            "select dsa_kernel_backend='cudnn' or 'none'."
+        ) from exc
+    if not _HAVE_TILELANG_SPARSE_MLA:
+        raise ImportError(
+            "dsa_kernel_backend='tilelang' was requested but the TileLang sparse-MLA "
+            "forward/backward kernels are unavailable in this environment (the adapter "
+            "imported, its kernels did not). Without them every forward would silently "
+            "run the PyTorch reference; install a working TileLang build, or select "
+            "dsa_kernel_backend='cudnn' or 'none'."
+        )
+
+
 def validate_csa2_config(config) -> None:
     """Reject inconsistent owners, compression ratios and hierarchical candidate pools."""
     if not config.multi_latent_attention or not config.qk_layernorm:
@@ -17,13 +44,15 @@ def validate_csa2_config(config) -> None:
         raise NotImplementedError("CSA2 currently requires TP=1")
     if config.fp16 or config.params_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError("CSA2 supports FP32 or BF16 parameters")
-    # The TileLang CSA2 sparse-MLA backend is not in this tree: csa2.py used to import
-    # .ops.tilelang_csa_sparse_mla, but no such adapter module was ever committed, so a
-    # config that validated here still died with ModuleNotFoundError on the first forward.
-    # Do not re-accept 'tilelang' until that adapter lands with it -- 'tilelang' stays valid
-    # for the separate DSA path (dsa_tilelang_kernels.py), which CSA2 does not use.
-    if config.dsa_kernel_backend not in ("none", "cudnn"):
-        raise ValueError("CSA2 supports the native and cuDNN sparse attention backends")
+    # 'tilelang' is accepted only together with the adapter it needs: the check below
+    # imports the kernel runtime, so a config that validates here cannot die with a
+    # ModuleNotFoundError on the first forward.
+    if config.dsa_kernel_backend not in ("none", "cudnn", "tilelang"):
+        raise ValueError(
+            "CSA2 supports the native, cuDNN and TileLang sparse attention backends"
+        )
+    if config.dsa_kernel_backend == "tilelang":
+        _validate_tilelang_backend_dependencies()
     if config.dsa_kernel_backend != "none" and config.params_dtype != torch.bfloat16:
         raise ValueError("Fused CSA2 attention requires BF16 parameters")
     if config.attention_dropout or config.hidden_dropout:
