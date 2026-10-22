@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -1384,7 +1385,7 @@ class CompressedSparseAttention2(MegatronModule):
             non_compressed_lse=non_compressed_lse,
         )
 
-    def forward(
+    def _forward_impl(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -1552,6 +1553,32 @@ class CompressedSparseAttention2(MegatronModule):
         if thd_layout is not None:
             output = output.masked_fill(~thd_layout.valid_tokens[:, None, None], 0)
         return output
+
+    def forward(self, *args, **kwargs):
+        """Run the attention GEMMs outside the FP8 autocast.
+
+        CSA2's projections (MLA q/kv, the compressor, the DSA indexer) stay in BF16/FP32
+        even when the model is quantized: a global FP8 run is intended to speed up the
+        MoE path, and the attention GEMMs are the numerically sensitive side.
+        ``get_fp8_disabled_context`` is a no-op when quantization is off, so the BF16
+        path is unchanged.
+
+        Scope note: this wrapper covers the CSA2 core (compressor and indexer). The
+        model's MLA q/kv/up projections are built one level up, in
+        ``DSv4HybridAttention``, which applies the same disabled context around its own
+        forward -- both wrappers are needed, since ``_fp8_round_trip``/FP8 see the
+        projections only outside this class.
+
+        ``is_init`` note: ``get_fp8_disabled_context(config, is_init=True)`` would be
+        required only if the parameters themselves are created quantized
+        (``fp8_param=True``), because TE then builds them inside ``fp8_model_init``.
+        This model does not use ``fp8_param``: the LoRA merge path
+        (``LoRALinear.merged_weight``) requires a dense base weight, so enabling it
+        here would silently dequantize. If that ever changes, wrap the projections'
+        construction with the ``is_init=True`` variant.
+        """
+        with get_fp8_disabled_context(self.config):
+            return self._forward_impl(*args, **kwargs)
 
     def backward_dw(self) -> None:
         """Flush the compressor and indexer linears using the existing DSv4 interface."""

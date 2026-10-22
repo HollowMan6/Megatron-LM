@@ -63,8 +63,17 @@ def validate_csa2_config(config) -> None:
         raise ValueError(
             "CSA2 uses bias-free projections, RMSNorm and unrotated indexer activations"
         )
-    if config.fp8 or config.fp4 or config.quant_recipe is not None:
-        raise NotImplementedError("CSA2 currently supports BF16/FP32 training, without weight QAT")
+    # CSA2's attention GEMMs (MLA q/kv, the compressor and the indexer) are exempted from
+    # FP8 by get_fp8_disabled_context(self.config) wrapped around
+    # CompressedSparseAttention2.forward, so a global fp8=... run is allowed here: the rest
+    # of the model is quantized, these layers stay in BF16/FP32.
+    if config.fp4 or config.quant_recipe is not None:
+        raise NotImplementedError(
+            "CSA2 does not support FP4 or weight QAT: its attention GEMMs are kept in "
+            "BF16/FP32 by the disabled quantization context, so there is no CSA2-side "
+            "hook that could quantize them or apply a QAT recipe. Relax this guard "
+            "together with such a hook."
+        )
     for name in ("layernorm_epsilon", "csa_compress_rotary_base"):
         if not math.isfinite(getattr(config, name)) or getattr(config, name) <= 0:
             raise ValueError(f"CSA2 requires positive finite {name}")

@@ -6,6 +6,7 @@ published inference implementation and does not call the CSA2 attention operator
 """
 
 import math
+from contextlib import nullcontext
 from copy import copy
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from torch import nn
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.fp8_utils import get_fp8_context, get_fp8_disabled_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -31,6 +33,9 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2IndexerSubmodules,
     CSA2State,
     select_candidate_blocks,
+)
+from megatron.core.transformer.experimental_attention_variant.csa2_config import (
+    validate_csa2_config,
 )
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_attention_spec,
@@ -58,6 +63,70 @@ from megatron.core.transformer.module import convert_module_to_dtype_except_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import _make_config
+
+
+def test_global_fp8_is_accepted_by_csa2_validation():
+    """A global FP8 run is valid: CSA2 keeps its own attention GEMMs out of the autocast."""
+    # Construction runs validate_csa2_config() through MLATransformerConfig.__post_init__.
+    config = _make_config(fp8="hybrid")
+    assert config.fp8 == "hybrid"
+    validate_csa2_config(config)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [("fp4", "e2m1"), ("quant_recipe", object())],
+    ids=["fp4", "quant_recipe"],
+)
+def test_fp4_and_weight_qat_are_still_rejected(field_name, value):
+    """FP4 and a QAT recipe have no CSA2 exemption path, so their guard stays."""
+    config = _make_config()
+    setattr(config, field_name, value)
+    with pytest.raises(NotImplementedError, match="QAT"):
+        validate_csa2_config(config)
+
+
+@pytest.mark.skipif(
+    not HAVE_TE or not torch.cuda.is_available(),
+    reason="TE FP8 global state needs Transformer Engine on a CUDA device",
+)
+def test_fp8_disabled_context_turns_fp8_off_around_csa2_gemms():
+    """Inside a global FP8 run the wrapper used by CSA2 reports TE FP8 as disabled."""
+    import transformer_engine.pytorch.fp8  # noqa: F401  (TE registers its fp8 submodule)
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    config = _make_config(fp8="hybrid")
+    # With quantization off the wrapper must be a genuine no-op, not a disabled context.
+    assert isinstance(get_fp8_disabled_context(_make_config()), nullcontext)
+    assert not isinstance(get_fp8_disabled_context(config), nullcontext)
+    with get_fp8_context(config):
+        assert FP8GlobalStateManager.is_fp8_enabled()
+        with get_fp8_disabled_context(config):
+            assert not FP8GlobalStateManager.is_fp8_enabled()
+        assert FP8GlobalStateManager.is_fp8_enabled()
+    assert not FP8GlobalStateManager.is_fp8_enabled()
+
+
+def test_forward_runs_under_the_disabled_quantization_context(pg_collection, monkeypatch):
+    """CompressedSparseAttention2.forward enters the disabled context around its GEMMs."""
+    contexts = []
+    real_context = get_fp8_disabled_context
+
+    def record(config):
+        context = real_context(config)
+        contexts.append((config, context))
+        return context
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.experimental_attention_variant.csa2.get_fp8_disabled_context",
+        record,
+    )
+    layer = _layer(pg_collection, 2)
+    x = torch.randn(5, 2, layer.config.hidden_size, device="cuda")
+    layer(x, None)
+    assert len(contexts) == 1
+    assert contexts[0][0] is layer.config
+    assert isinstance(contexts[0][1], nullcontext)
 
 
 class _IEEEFP32Linear(nn.Module):

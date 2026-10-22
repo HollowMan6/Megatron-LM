@@ -19,6 +19,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
@@ -276,7 +277,7 @@ class DSv4HybridAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
-    def forward(
+    def _forward_impl(
         self,
         hidden_states,
         attention_mask,
@@ -491,6 +492,19 @@ class DSv4HybridAttention(Attention):
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
+
+    def forward(self, *args, **kwargs):
+        """Run the attention GEMMs outside the FP8 autocast.
+
+        The MLA q/kv/up projections and the CSA2 core are the numerically sensitive
+        side of this stack: a global FP8 run is meant to speed up the MoE path, and
+        keeping the attention in BF16/FP32 is the documented intent (the config
+        validation allows fp8 for exactly this reason).
+        ``get_fp8_disabled_context`` is a no-op when quantization is off, so the
+        BF16 path is unchanged.
+        """
+        with get_fp8_disabled_context(self.config):
+            return self._forward_impl(*args, **kwargs)
 
 
 class DSv4HybridSelfAttention(DSv4HybridAttention):
