@@ -19,7 +19,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_context, install_fp8_columnwise_free_hooks
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -446,6 +446,11 @@ class HybridStack(MegatronModule):
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
+
+        if self.config.fp8_param_free_columnwise_after_backward:
+            # Free each FP8 weight's columnwise copy as soon as its module has finished
+            # its backward; TE recreates it on demand from the row-wise copy next step.
+            install_fp8_columnwise_free_hooks(self)
 
     @property
     def layer_type_list(self) -> list[str]:

@@ -71,6 +71,16 @@ except (ImportError, ModuleNotFoundError):
     GroupedTensor = None
     HAVE_TE_GROUPED_TENSOR_CLASS = False
 
+try:
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+
+    HAVE_TE_BLOCKWISE_TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # Columnwise copies only exist for blockwise-scaled tensors, so without TE's blockwise
+    # class neither the transient mode nor the hooks can match anything.
+    Float8BlockwiseQTensor = None
+    HAVE_TE_BLOCKWISE_TENSOR = False
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
@@ -690,7 +700,13 @@ def modify_underlying_storage(tensor: torch.Tensor, new_raw_data: torch.Tensor):
 def quantize_param_shard(
     model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
 ):
-    """Cast shard fp32 main params to fp8 model params."""
+    """Cast shard fp32 main params to fp8 model params.
+
+    Also one of the per-step entry points where a config asking for transient columnwise
+    copies is checked to have actually been honoured by the model's block class (see
+    ``_check_columnwise_free_installed``).
+    """
+    _check_columnwise_free_installed()
     _quantize_param_shard_impl(
         model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
     )
@@ -702,14 +718,81 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
     _correct_amax_history_if_needed_impl(model)
 
 
+# Whether the blockwise FP8 columnwise copies should exist only while a dgrad needs them,
+# i.e. TransformerConfig.fp8_param_free_columnwise_after_backward is on. Two pieces of state
+# carry that contract, both set from outside this module:
+#   * _FP8_COLUMN_WISE_EXPECTED -- set by the config whenever the flag is on. It is the
+#     expectation that some block class installs the hooks below.
+#   * _FP8_COLUMN_WISE_TRANSIENT / _FP8_COLUMN_WISE_INSTALLED_HOOKS -- set by
+#     install_fp8_columnwise_free_hooks() (called at the end of a block class' __init__:
+#     TransformerBlock and HybridStack today).
+# A flag that is on while nothing was installed would silently save nothing, so the
+# training-facing paths call _check_columnwise_free_installed() and fail loudly instead.
+_FP8_COLUMN_WISE_EXPECTED = False
+_FP8_COLUMN_WISE_TRANSIENT = False
+_FP8_COLUMN_WISE_INSTALLED_HOOKS = 0
+
+_COLUMN_WISE_FREE_NOT_INSTALLED = (
+    "fp8_param_free_columnwise_after_backward=True, but no columnwise-free backward hook "
+    "was installed. The columnwise copies can only be released if every block class of the "
+    "model calls install_fp8_columnwise_free_hooks(self) at the end of its __init__ (see "
+    "TransformerBlock and HybridStack). Otherwise the flag would silently save nothing."
+)
+
+
+def mark_fp8_columnwise_free_expected() -> None:
+    """Record that the config asked for transient columnwise copies."""
+    global _FP8_COLUMN_WISE_EXPECTED
+
+    _FP8_COLUMN_WISE_EXPECTED = True
+
+
+def is_fp8_columnwise_free_installed() -> bool:
+    """Whether any module currently carries the columnwise-free backward hook."""
+    return _FP8_COLUMN_WISE_INSTALLED_HOOKS > 0
+
+
+def _check_columnwise_free_installed() -> None:
+    """Fail loudly when the flag is on but no block class installed the hooks."""
+    if _FP8_COLUMN_WISE_EXPECTED and not is_fp8_columnwise_free_installed():
+        raise RuntimeError(_COLUMN_WISE_FREE_NOT_INSTALLED)
+
+
+def _is_blockwise_fp8_tensor(tensor) -> bool:
+    """Whether a tensor is a Transformer Engine blockwise (2D-scaled) FP8 tensor."""
+    return HAVE_TE_BLOCKWISE_TENSOR and _is_instance_or_param_data(tensor, Float8BlockwiseQTensor)
+
+
+def _free_columnwise_copy(param) -> bool:
+    """Drop one parameter's columnwise FP8 copy; return whether one was released.
+
+    The rowwise copy -- what the forward GEMM, the wgrad and the optimizer consume -- is
+    kept, and TE transposes it back on demand, so this is always safe to call on a
+    blockwise weight at a point where the rowwise data is up to date. TE asserts that at
+    least one copy survives, so columnwise-only parameters are left alone.
+    """
+    if getattr(param, "_columnwise_data", None) is None:
+        return False
+    if getattr(param, "_rowwise_data", None) is None:
+        return False
+    update_usage = getattr(param, "update_usage", None)
+    if update_usage is None:
+        return False
+    update_usage(columnwise_usage=False)
+    return True
+
+
 def post_all_gather_processing(model_params):
     """
     Post-processing after all-gather for weights in distributed optimizer.
     - tensorwise: may need to create a transposed view to match backend GEMM.
-    - blockwise: create column-wise storage.
+    - blockwise: create column-wise storage, or (when the columnwise copies are transient, see
+      ``_FP8_COLUMN_WISE_TRANSIENT``) drop the stale copy left by the previous step.
     """
     if not isinstance(model_params, list):
         model_params = [model_params]
+
+    _check_columnwise_free_installed()
 
     expanded_model_params = []
     for param in model_params:
@@ -719,7 +802,32 @@ def post_all_gather_processing(model_params):
             expanded_model_params.append(param)
 
     if te_post_all_gather_processing is not None:
-        te_post_all_gather_processing(expanded_model_params)
+        if not _FP8_COLUMN_WISE_TRANSIENT:
+            te_post_all_gather_processing(expanded_model_params)
+            return
+
+        # The columnwise copies are transient, so instead of transposing every blockwise
+        # weight here we drop the copy: the all-gather has just refreshed the rowwise data,
+        # which makes any surviving columnwise copy stale, and TE rebuilds a fresh one in the
+        # dgrad of whichever module needs it (and only for that module).
+        #
+        # This adds no work: the blockwise transpose in this hook already costs ~0.02 ms per
+        # weight (~2274 weights/rank, ~45 ms of a ~4.5 s step, at ~1 TB/s), it merely moves
+        # from here into the dgrads that need the copy.
+        #
+        # Every other scaling keeps today's behavior, including Float8Tensor's transposed
+        # view, so those recipes are untouched. The megatron-fsdp path calls TE's function
+        # directly (megatron_fsdp/mixed_precision.py) and is likewise untouched; so is CUDA
+        # graph capture, which relies on this step-start creation to keep the columnwise
+        # buffers stable across replays -- do not enable the flag together with graphs.
+        other_recipe_params = []
+        for param in expanded_model_params:
+            if _is_blockwise_fp8_tensor(param):
+                _free_columnwise_copy(param)
+            else:
+                other_recipe_params.append(param)
+        if other_recipe_params:
+            te_post_all_gather_processing(other_recipe_params)
     else:
         # If the TE version is old and does not have post_all_gather_processing function, this is
         # a no-op, and the transpose/columnwise data will be created in the next forward pass.
@@ -1072,3 +1180,101 @@ else:
             "prepare_model_for_fp8_inference requires Transformer Engine to be installed. "
             "Please install transformer-engine to use FP8 inference."
         )
+
+
+# Attribute stamped on a module once the columnwise-free backward hook is installed, so a
+# repeated install (or a re-run of TransformerBlock._build_layers) does not stack hooks.
+_FP8_COLUMN_WISE_FREE_HOOK_FLAG = "_fp8_columnwise_free_hook"
+
+
+def free_fp8_columnwise_after_backward(module) -> int:
+    """Release the columnwise FP8 copies held by ``module``'s parameters.
+
+    Transformer Engine keeps two copies of every blockwise-quantized FP8 weight: the
+    rowwise copy (consumed by the forward GEMM and by the wgrad) and the transposed
+    columnwise copy (consumed by the dgrad). ``Linear.backward`` materializes the
+    columnwise copy through ``update_usage(columnwise_usage=True)`` and nothing ever
+    releases it again, so with ``fp8_param=True`` every weight pays for a full second
+    copy of itself for the rest of training.
+
+    ``update_usage(columnwise_usage=False)`` drops that copy while keeping the rowwise
+    one, which at blockwise (2D) scaling TE can always transpose back on demand
+    (``Float8BlockwiseQTensorStorage._create_columnwise`` -> ``tex.fp8_transpose``). The
+    dgrad therefore stays correct; it only pays a cheap transpose the next time the
+    weight is used backwards.
+
+    Parameters without a rowwise copy are left alone: TE's ``update_usage`` asserts that
+    at least one copy survives, and a columnwise-only weight could not be rebuilt from
+    what we would keep.
+
+    Args:
+        module (torch.nn.Module): module whose (recursive) parameters are inspected.
+
+    Returns:
+        int: number of parameters whose columnwise copy was released.
+    """
+    freed = 0
+    for param in module.parameters():
+        if _free_columnwise_copy(param):
+            freed += 1
+    return freed
+
+
+def _run_fp8_columnwise_free_hook(module, *unused) -> None:
+    """Backward-hook body. Takes ``*unused`` grad args so it never builds a tuple."""
+    free_fp8_columnwise_after_backward(module)
+
+
+def _owns_fp8_quantized_weight(module) -> bool:
+    """Whether ``module`` directly owns a rowwise-quantized FP8 weight parameter."""
+    for param in module.parameters(recurse=False):
+        if getattr(param, "_rowwise_data", None) is None:
+            continue
+        if getattr(param, "update_usage", None) is not None:
+            return True
+    return False
+
+
+def install_fp8_columnwise_free_hooks(model) -> int:
+    """Install backward hooks that release each FP8 weight's columnwise copy.
+
+    Every module that directly owns a rowwise-quantized FP8 weight gets a full backward
+    hook. The hook runs once that module's backward (and therefore its dgrad, the only
+    consumer of the columnwise copy) is done, and frees the copy; the next step rebuilds
+    it inside TE's backward if and when it is needed again.
+
+    Installing also switches the distributed-optimizer all-gather path to the transient
+    contract (``_FP8_COLUMN_WISE_TRANSIENT``): the step-start ``post_all_gather_processing``
+    drops the stale copy instead of transposing every weight back, so the columnwise copies
+    exist only between a module's dgrad and the end of that module's backward. The transpose
+    is not added work -- TE already paid one per weight per step in that all-gather hook --
+    it only moves from the all-gather to the dgrads that need it.
+
+    Uses ``register_full_backward_hook`` rather than the deprecated and unsafe
+    ``register_backward_hook``: it fires after the module's whole backward, so the dgrad
+    operands TE materializes inside that backward are no longer in use. Verified to fire
+    with TE's custom ``Linear`` autograd function.
+
+    Safe as a strict no-op when Transformer Engine is absent (no parameter exposes
+    ``update_usage``, so nothing qualifies).
+
+    Args:
+        model (torch.nn.Module): model (or block) to walk.
+
+    Returns:
+        int: number of modules the hook was installed on.
+    """
+    global _FP8_COLUMN_WISE_TRANSIENT, _FP8_COLUMN_WISE_INSTALLED_HOOKS
+
+    _FP8_COLUMN_WISE_TRANSIENT = True
+    installed = 0
+    for module in model.modules():
+        if getattr(module, _FP8_COLUMN_WISE_FREE_HOOK_FLAG, False):
+            continue
+        if not _owns_fp8_quantized_weight(module):
+            continue
+        module.register_full_backward_hook(_run_fp8_columnwise_free_hook)
+        setattr(module, _FP8_COLUMN_WISE_FREE_HOOK_FLAG, True)
+        installed += 1
+    _FP8_COLUMN_WISE_INSTALLED_HOOKS += installed
+    return installed

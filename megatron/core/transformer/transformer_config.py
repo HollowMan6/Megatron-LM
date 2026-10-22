@@ -710,6 +710,26 @@ class TransformerConfig(ModelParallelConfig):
     primarily the weights of GEMMs. The specific parameters that will be converted to fp8 are
     determined by TE."""
 
+    fp8_param_free_columnwise_after_backward: bool = False
+    """If set, make the columnwise FP8 weight copies exist only while a dgrad needs them.
+
+    Transformer Engine materializes a transposed (columnwise) copy of every blockwise FP8
+    weight in ``Linear.backward`` for the dgrad and keeps it afterwards, so with
+    ``fp8_param=True`` every weight ends up paying for a second copy of itself. With this
+    flag the copy is released as soon as the owning module's backward is done, and the
+    distributed optimizer's step-start post-processing drops it instead of transposing
+    every weight back, so a copy lives only between one module's dgrad and the end of that
+    module's backward. TE recreates it on demand from the rowwise copy -- the one the
+    forward, the wgrad and the optimizer use, never touched -- via ``tex.fp8_transpose``
+    plus the scale-grid transpose, which is bit-exact at 2D scaling.
+
+    Cost: one transpose per weight per step, ~0.02 ms each, in the dgrads that need the
+    copy. On a stack whose step-start all-gather post-processing runs, the transpose was
+    already paid there, so this only moves it; on a stack that never runs it (e.g.
+    ``fp8_param_gather=False``) it replaces a cached copy that had gone stale against the
+    updated weights with a fresh one. Requires ``fp8_param=True`` (and with it fp8 mode).
+    Not compatible with CUDA-graph capture. Default False, i.e. a strict no-op."""
+
     fp8_quantizer_factory: Optional[str] = None
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp8_recipe is custom."""
@@ -1966,6 +1986,20 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
+
+        if self.fp8_param_free_columnwise_after_backward and not self.fp8_param:
+            raise ValueError(
+                "fp8_param_free_columnwise_after_backward must be used together with "
+                "fp8_param mode."
+            )
+
+        if self.fp8_param_free_columnwise_after_backward:
+            # Record the contract for the training path: some block class has to install the
+            # columnwise-free backward hooks, and the per-step paths fail loudly if none did
+            # (see fp8_utils._check_columnwise_free_installed).
+            from megatron.core.fp8_utils import mark_fp8_columnwise_free_expected
+
+            mark_fp8_columnwise_free_expected()
 
         if self.fp8_output_proj:
             if not self.fp8:

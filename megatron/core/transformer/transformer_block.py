@@ -14,7 +14,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_context, install_fp8_columnwise_free_hooks
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -345,6 +345,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+        if config.fp8_param_free_columnwise_after_backward:
+            # Free each FP8 weight's columnwise copy as soon as its module has finished
+            # its backward; TE recreates it on demand from the rowwise copy next step.
+            install_fp8_columnwise_free_hooks(self)
 
     def _build_layers(self):
         # Transformer layers.
