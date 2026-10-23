@@ -78,6 +78,103 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         return grad_input, None, None
 
 
+class _HaloGrad(torch.autograd.Function):
+    """Attach the halo gradient exchange to an already-completed receive buffer.
+
+    The transfer itself is issued by :func:`start_csa2_boundary_exchange` (so it can
+    overlap with the caller's projections) and awaited by
+    :func:`finish_csa2_boundary_exchange`. This node only carries autograd: its
+    forward is the identity on ``received`` (which is a function of ``hidden``
+    because ``hidden``'s tail was sent to the same peer), and its backward returns
+    the neighbor's halo gradient exactly like the blocking implementation.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden: Tensor, received: Tensor, halo_rows: int, cp_group):
+        ctx.cp_group = cp_group
+        ctx.halo_rows = halo_rows
+        ctx.input_shape = hidden.shape
+        return received
+
+    @staticmethod
+    def backward(ctx, grad_boundary: Tensor):
+        group = ctx.cp_group
+        rank, size = group.rank(), group.size()
+        grad_input = grad_boundary.new_zeros(ctx.input_shape)
+        ops = []
+        received = None
+        if rank > 0:
+            ops.append(
+                dist.P2POp(
+                    dist.isend,
+                    grad_boundary.contiguous(),
+                    dist.get_global_rank(group, rank - 1),
+                    group,
+                )
+            )
+        if rank + 1 < size:
+            received = grad_boundary.new_empty(grad_boundary.shape)
+            ops.append(
+                dist.P2POp(dist.irecv, received, dist.get_global_rank(group, rank + 1), group)
+            )
+        for request in dist.batch_isend_irecv(ops):
+            request.wait()
+        if received is not None:
+            grad_input[-ctx.halo_rows :] = received
+        return grad_input, None, None, None
+
+
+class CSA2BoundaryExchange:
+    """Handle for an in-flight left-boundary halo exchange."""
+
+    __slots__ = ("hidden", "recv", "requests", "halo_rows", "cp_group")
+
+    def __init__(self, hidden, recv, requests, halo_rows, cp_group):
+        self.hidden = hidden
+        self.recv = recv
+        self.requests = requests
+        self.halo_rows = halo_rows
+        self.cp_group = cp_group
+
+
+def start_csa2_boundary_exchange(
+    hidden: Tensor, halo_rows: int, cp_group: dist.ProcessGroup
+) -> CSA2BoundaryExchange:
+    """Issue the halo send/recv without waiting, so it overlaps the caller's compute.
+
+    ``hidden`` must not be modified in place until :func:`finish_csa2_boundary_exchange`
+    is called: the sent tail is snapshotted by ``contiguous()`` here, but the caller
+    still owns the tensor.
+    """
+    if hidden.shape[0] < halo_rows:
+        raise ValueError("CSA2 CP local rows must cover the attention halo")
+    rank, size = cp_group.rank(), cp_group.size()
+    recv = hidden.new_zeros((halo_rows,) + hidden.shape[1:])
+    ops = []
+    if rank > 0:
+        ops.append(
+            dist.P2POp(dist.irecv, recv, dist.get_global_rank(cp_group, rank - 1), cp_group)
+        )
+    if rank + 1 < size:
+        ops.append(
+            dist.P2POp(
+                dist.isend,
+                hidden[-halo_rows:].contiguous(),
+                dist.get_global_rank(cp_group, rank + 1),
+                cp_group,
+            )
+        )
+    requests = dist.batch_isend_irecv(ops) if ops else []
+    return CSA2BoundaryExchange(hidden, recv, requests, halo_rows, cp_group)
+
+
+def finish_csa2_boundary_exchange(handle: CSA2BoundaryExchange) -> Tensor:
+    """Await the in-flight exchange and return the halo with its gradient path."""
+    for request in handle.requests:
+        request.wait()
+    return _HaloGrad.apply(handle.hidden, handle.recv, handle.halo_rows, handle.cp_group)
+
+
 def exchange_csa2_boundary_hidden(
     hidden: Tensor, halo_rows: int, cp_group: dist.ProcessGroup
 ) -> Tensor:

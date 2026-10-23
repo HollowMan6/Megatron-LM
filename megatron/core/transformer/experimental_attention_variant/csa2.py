@@ -94,6 +94,37 @@ _check_reported: set = set()
 _FUSED_DISABLE = os.environ.get("CSA2_FUSED_DISABLE", "0") == "1"
 
 
+# The causal key limit depends only on the (immutable) THD layout and the compressed
+# layout, but the computation below reads ~6 device scalars back to the host
+# (`.any()`, `.min()`, `nonzero().numel()`, `int(first_false[0])`, `.all()`), i.e. it
+# synchronises the host with the device once per layer per forward. Cache it on the
+# identity of the two layout objects, holding strong references so the ids stay valid.
+_CAUSAL_LIMIT_CACHE: dict = {}
+_CAUSAL_LIMIT_CACHE_MAX = 64
+
+
+def _causal_key_limit(thd_layout, compressed_layout, keys: int) -> int:
+    """Return the causal key limit for these layouts, computing it once per layout pair."""
+    key = (id(thd_layout), id(compressed_layout), keys)
+    hit = _CAUSAL_LIMIT_CACHE.get(key)
+    if hit is not None:
+        ref_thd, ref_comp, value = hit
+        if ref_thd is thd_layout and ref_comp is compressed_layout:
+            return value
+    value = keys
+    if bool(thd_layout.valid_tokens.any()) and int(thd_layout.sequence_ids.min()) >= 0:
+        vg = compressed_layout.valid_groups
+        first_false = (~vg).nonzero().flatten()
+        if first_false.numel():
+            limit = int(first_false[0])
+            if bool(vg[limit:].logical_not().all()):
+                value = limit
+    if len(_CAUSAL_LIMIT_CACHE) >= _CAUSAL_LIMIT_CACHE_MAX:
+        _CAUSAL_LIMIT_CACHE.clear()
+    _CAUSAL_LIMIT_CACHE[key] = (thd_layout, compressed_layout, value)
+    return value
+
+
 def _chunked_csa2_indexer_scores(
     q: torch.Tensor, indexer_k: torch.Tensor, weights: torch.Tensor, key_chunk_size: int = 64
 ) -> torch.Tensor:
@@ -321,14 +352,7 @@ def _streaming_indexer_topk(
     #     for every row there); only safe for a monotone
     #     [true...true, false...false] valid_groups (multi-sequence packs
     #     can have interior unassigned slots between sequences).
-    causal_key_limit = keys
-    if thd_layout.valid_tokens.any() and int(thd_layout.sequence_ids.min()) >= 0:
-        vg = compressed_layout.valid_groups
-        first_false = (~vg).nonzero().flatten()
-        if first_false.numel():
-            limit = int(first_false[0])
-            if bool(vg[limit:].logical_not().all()):
-                causal_key_limit = limit
+    causal_key_limit = _causal_key_limit(thd_layout, compressed_layout, keys)
     # (2) Candidate: with a candidate set, a 64-key tile with no candidate
     #     key for any row is dead for every row. Only live tiles are staged --
     #     unless this pass also folds the candidate-source block table, whose

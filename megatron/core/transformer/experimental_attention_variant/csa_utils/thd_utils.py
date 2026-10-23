@@ -267,7 +267,38 @@ class CSA2THDLayout:
             )
 
 
+# The layout is an immutable snapshot that depends only on (packed metadata identity,
+# local token capacity, CP group). Every layer of a stack rebuilds it from the same
+# inputs, and each build runs several device-side validations (`_check_values` ->
+# `torch._assert_async`), which showed up as ~8k host/device assert kernels per
+# training step in an nsys capture. Memoising on the *identity* of the inputs keeps
+# the validation once per distinct metadata object instead of once per layer.
+_THD_LAYOUT_CACHE: dict = {}
+_THD_LAYOUT_CACHE_MAX = 64
+
+
 def build_csa2_thd_layout(
+    packed_seq_params: PackedSeqParams,
+    total_tokens: int,
+    *,
+    cp_group: torch.distributed.ProcessGroup | None = None,
+) -> CSA2THDLayout:
+    """Memoised wrapper; see :func:`_build_csa2_thd_layout` for the semantics."""
+    key = (id(packed_seq_params), total_tokens, id(cp_group))
+    hit = _THD_LAYOUT_CACHE.get(key)
+    if hit is not None:
+        ref_psp, ref_group, layout = hit
+        if ref_psp is packed_seq_params and ref_group is cp_group:
+            return layout
+    layout = _build_csa2_thd_layout(packed_seq_params, total_tokens, cp_group=cp_group)
+    if len(_THD_LAYOUT_CACHE) >= _THD_LAYOUT_CACHE_MAX:
+        _THD_LAYOUT_CACHE.clear()
+    # Hold strong references so the identity keys cannot be recycled while cached.
+    _THD_LAYOUT_CACHE[key] = (packed_seq_params, cp_group, layout)
+    return layout
+
+
+def _build_csa2_thd_layout(
     packed_seq_params: PackedSeqParams,
     total_tokens: int,
     *,
