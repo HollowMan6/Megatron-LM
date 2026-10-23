@@ -18,12 +18,15 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.tensor_observation import suspend_tensor_observations
-try:  # pragma: no cover - optional dependency
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
-
-    HAVE_TE = True
-except (ImportError, ModuleNotFoundError):  # pragma: no cover
-    HAVE_TE = False
+# Imported lazily (see _te_fp8): a module-level transformer_engine import here
+# measurably slows Megatron's package import because TE initialises cuDNN/cuBLAS.
+def _te_fp8():
+    """Return (FP8GlobalStateManager, fp8_autocast), or (None, None) without TE."""
+    try:
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+        return FP8GlobalStateManager, fp8_autocast
+    except (ImportError, ModuleNotFoundError):
+        return None, None
 from megatron.core.tensor_parallel import random as rng
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 
@@ -100,9 +103,10 @@ def _checkpoint_contexts():
     @contextmanager
     def forward():
         saved["tracker"] = clone_states(rng.get_cuda_rng_tracker().get_states())
-        if HAVE_TE:
-            saved["fp8"] = FP8GlobalStateManager.is_fp8_enabled()
-            saved["fp8_recipe"] = FP8GlobalStateManager.get_fp8_recipe() if saved["fp8"] else None
+        _gsm, _ = _te_fp8()
+        if _gsm is not None:
+            saved["fp8"] = _gsm.is_fp8_enabled()
+            saved["fp8_recipe"] = _gsm.get_fp8_recipe() if saved["fp8"] else None
         else:
             saved["fp8"] = False
             saved["fp8_recipe"] = None
@@ -120,8 +124,9 @@ def _checkpoint_contexts():
         previous_states, previous = tracker.get_states(), rng.is_checkpointing()
         tracker.set_states(clone_states(saved["tracker"]))
         rng._set_checkpointing()
-        if saved.get("fp8"):
-            fp8_ctx = fp8_autocast(enabled=True, fp8_recipe=saved["fp8_recipe"])
+        _, _fp8_autocast = _te_fp8()
+        if saved.get("fp8") and _fp8_autocast is not None:
+            fp8_ctx = _fp8_autocast(enabled=True, fp8_recipe=saved["fp8_recipe"])
         else:
             fp8_ctx = contextlib.nullcontext()
         try:
