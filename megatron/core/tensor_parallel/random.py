@@ -614,6 +614,18 @@ class CheckpointFunction(torch.autograd.Function):
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
 
+        # Capture the quantized context so the recomputed forward runs under the same
+        # recipe as the original one. Without this, full recompute re-runs the layer in
+        # BF16 while persistent FP8 weights (fp8_param) still carry blockwise scales,
+        # and the dgrad GEMM later asserts on incompatible scaling modes. The selective
+        # path (CheckpointWithoutOutput) already does exactly this.
+        if HAVE_TE:
+            ctx.fp8 = FP8GlobalStateManager.is_fp8_enabled()
+            ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if ctx.fp8 else None
+        else:
+            ctx.fp8 = False
+            ctx.fp8_recipe = None
+
         with torch.no_grad():
             outputs = run_function(*args)
 
@@ -654,9 +666,18 @@ class CheckpointFunction(torch.autograd.Function):
             # Set the states to what it used to be before the forward pass.
             _set_all_rng_states(*ctx.rng_states)
 
-            # Compute the forward pass.
+            # Compute the forward pass, restoring the quantized context captured at
+            # forward time (mirrors CheckpointWithoutOutput.backward).
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad(), suspend_tensor_observations():
+            if getattr(ctx, "fp8", False):
+                recompute_ctx = activation_recompute_forward(
+                    activation_recompute=True, recompute_phase=True
+                )
+                fp8_ctx = fp8_autocast(enabled=True, fp8_recipe=ctx.fp8_recipe)
+            else:
+                recompute_ctx = contextlib.nullcontext()
+                fp8_ctx = contextlib.nullcontext()
+            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):

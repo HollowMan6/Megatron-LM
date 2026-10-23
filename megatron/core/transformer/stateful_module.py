@@ -8,6 +8,7 @@ code owns their meaning, while eager, checkpoint and graph execution use the
 same tensor signature. The module never retains a forward's state mapping.
 """
 
+import contextlib
 import gc
 from contextlib import contextmanager
 from typing import Mapping
@@ -17,6 +18,12 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.tensor_observation import suspend_tensor_observations
+try:  # pragma: no cover - optional dependency
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+
+    HAVE_TE = True
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
+    HAVE_TE = False
 from megatron.core.tensor_parallel import random as rng
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 
@@ -72,7 +79,15 @@ class StatefulModule(nn.Module):
 
 
 def _checkpoint_contexts():
-    """Preserve Megatron's model-parallel RNG in addition to PyTorch's default RNG."""
+    """Preserve Megatron's model-parallel RNG and the FP8 context across replay.
+
+    PyTorch's default RNG is handled by checkpoint itself; Megatron's model-parallel
+    tracker is added here. The quantized (FP8/FP4) context is captured as well: with
+    ``use_reentrant=False`` the replay runs the block OUTSIDE whatever ``fp8_autocast``
+    wrapped the original call, so without restoring it the replay would run in BF16
+    while the persistent FP8 weights (``fp8_param``) keep their block scales, and the
+    first backward would then assert on incompatible scaling modes in the GEMM.
+    """
     saved = {}
 
     def clone_states(states):
@@ -85,6 +100,12 @@ def _checkpoint_contexts():
     @contextmanager
     def forward():
         saved["tracker"] = clone_states(rng.get_cuda_rng_tracker().get_states())
+        if HAVE_TE:
+            saved["fp8"] = FP8GlobalStateManager.is_fp8_enabled()
+            saved["fp8_recipe"] = FP8GlobalStateManager.get_fp8_recipe() if saved["fp8"] else None
+        else:
+            saved["fp8"] = False
+            saved["fp8_recipe"] = None
         previous = rng.is_checkpointing()
         rng._set_checkpointing()
         try:
@@ -99,8 +120,12 @@ def _checkpoint_contexts():
         previous_states, previous = tracker.get_states(), rng.is_checkpointing()
         tracker.set_states(clone_states(saved["tracker"]))
         rng._set_checkpointing()
+        if saved.get("fp8"):
+            fp8_ctx = fp8_autocast(enabled=True, fp8_recipe=saved["fp8_recipe"])
+        else:
+            fp8_ctx = contextlib.nullcontext()
         try:
-            with suspend_tensor_observations():
+            with fp8_ctx, suspend_tensor_observations():
                 yield
         finally:
             tracker.set_states(previous_states)
