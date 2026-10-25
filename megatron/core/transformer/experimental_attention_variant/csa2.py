@@ -850,7 +850,12 @@ class CSA2Indexer(MegatronModule):
             raise ValueError("Provide either latent or indexer_k, not both.")
         q, weights = self._indexer_q_weights(x, qr, rotary_pos_emb, thd_layout)
         if torch.is_grad_enabled():
-            scores = torch.einsum("sbhd,tbd->bsht", q.float(), indexer_k.float()).relu()
+            # Keep the operands in their native dtype so the einsum runs on tensor cores
+            # (fp32 accumulate) instead of SIMT. Upcasting both operands to fp32 forced an
+            # sm80_xmma_gemm_f32f32_f32f32 kernel that cannot use tensor cores; the chunked
+            # inference path below already uses the native dtype. Only the reduced scores are
+            # promoted, which is where the head-weight mix needs the extra range.
+            scores = torch.einsum("sbhd,tbd->bsht", q, indexer_k).relu().float()
             scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
         else:
             scores = _chunked_csa2_indexer_scores(q, indexer_k, weights)

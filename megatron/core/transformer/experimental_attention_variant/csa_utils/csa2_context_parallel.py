@@ -3,6 +3,7 @@
 """CSA2 local compression and canonical shared-K addressing on the DSv4 CP path."""
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -10,6 +11,18 @@ import torch.distributed as dist
 from torch import Tensor
 
 from .thd_utils import CSA2THDCompressionLayout, CSA2THDLayout
+
+
+def _halo_xchg_mode() -> str:
+    """Select how the CSA2 CP halo gradient is exchanged in the backward pass.
+
+    ``allgather`` (default) uses one group-wide all-gather; ``p2p`` keeps the
+    original directed ring. The ring is cheaper in bytes but makes every rank wait
+    for a single neighbour, which can close a cross-communicator deadlock cycle with
+    the MoE dispatcher's device-to-host split synchronisation on long-context
+    context-parallel runs. See ``_LeftBoundaryExchange.backward``.
+    """
+    return "p2p" if os.environ.get("DSV41_HALO_XCHG", "").strip().lower() == "p2p" else "allgather"
 
 
 def get_cp_compressor_capacity(local_rows: int, ratio: int) -> int:
@@ -52,29 +65,59 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_boundary: Tensor):
-        """Return halo gradients to the rank that owns the exchanged rows."""
+        """Return halo gradients to the rank that owns the exchanged rows.
+
+        Rank ``r``'s tail gradient is consumed by rank ``r - 1``, so the direct
+        implementation is a directed point-to-point ring. That ring is the fragile
+        part of this path: each rank waits for exactly one neighbour, and the
+        neighbour may be parked inside a different communicator's host-side
+        synchronisation (the MoE dispatcher waits for its device-to-host expert
+        split copy before the variable-size all-to-all). At long-context CP the two
+        waits close a cycle -- the neighbour cannot issue the message this rank
+        needs until a collective this rank is already blocking completes -- and the
+        job stalls until the NCCL watchdog fires.
+
+        ``_HALO_XCHG`` selects the exchange. ``allgather`` (default) replaces the
+        ring with one group-wide collective: slot ``r`` holds rank ``r``'s boundary
+        gradient and rank ``r - 1`` copies slot ``r`` into its tail, so the values
+        are identical while every rank waits for the same collective and no rank can
+        be the unique blocker of another. ``p2p`` keeps the original ring for
+        comparison and for groups small enough that the ring is clearly cheaper.
+        Both are measured by the caller's training loop; see the worklog entry from
+        2026-10-25 for the step times that made ``allgather`` the default.
+        """
         group = ctx.cp_group
         rank, size = group.rank(), group.size()
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
-        ops = []
-        if rank > 0:
-            ops.append(
-                dist.P2POp(
-                    dist.isend,
-                    grad_boundary.contiguous(),
-                    dist.get_global_rank(group, rank - 1),
-                    group,
+        if size == 1:
+            return grad_input, None, None
+        if _halo_xchg_mode() == "p2p":
+            ops = []
+            if rank > 0:
+                ops.append(
+                    dist.P2POp(
+                        dist.isend,
+                        grad_boundary.contiguous(),
+                        dist.get_global_rank(group, rank - 1),
+                        group,
+                    )
                 )
-            )
+            received = None
+            if rank + 1 < size:
+                received = grad_boundary.new_empty(grad_boundary.shape)
+                ops.append(
+                    dist.P2POp(dist.irecv, received, dist.get_global_rank(group, rank + 1), group)
+                )
+            for request in dist.batch_isend_irecv(ops):
+                request.wait()
+            if received is not None:
+                grad_input[-ctx.halo_rows :] = received
+            return grad_input, None, None
+        halo = grad_boundary.contiguous()
+        gathered = halo.new_empty((size,) + tuple(halo.shape))
+        dist.all_gather_into_tensor(gathered, halo, group=group)
         if rank + 1 < size:
-            received = grad_boundary.new_empty(grad_boundary.shape)
-            ops.append(
-                dist.P2POp(dist.irecv, received, dist.get_global_rank(group, rank + 1), group)
-            )
-        for request in dist.batch_isend_irecv(ops):
-            request.wait()
-        if rank + 1 < size:
-            grad_input[-ctx.halo_rows :] = received
+            grad_input[-ctx.halo_rows :] = gathered[rank + 1]
         return grad_input, None, None
 
 
