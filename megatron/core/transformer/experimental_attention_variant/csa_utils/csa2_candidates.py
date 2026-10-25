@@ -119,7 +119,13 @@ def candidate_blocks_from_block_scores(
     parts = []
     for start in range(0, flat.shape[0], row_chunk):
         block = flat[start : start + row_chunk]
-        parts.append(block.argsort(dim=-1, descending=True, stable=True)[..., :keep_blocks])
+        # Clone the slice: `[..., :keep_blocks]` of the argsort result is a *view*
+        # that keeps the whole full-width int64 sort output alive. Chunking bounds
+        # the sort workspace but not what is retained afterwards, so at 512K the
+        # collected views still hold rows*num_blocks*8 bytes per chunk sum
+        # (measured on CPU for the pinned shapes: a 256 B slice retains 4096 B).
+        # The copy keeps the same stable order and lets the full-width result go.
+        parts.append(block.argsort(dim=-1, descending=True, stable=True)[..., :keep_blocks].clone())
     ids = torch.cat(parts, dim=0).reshape(*block_scores.shape[:-1], keep_blocks)
     valid = block_scores.gather(-1, ids) > -torch.inf
     sentinel = torch.iinfo(torch.int32).max

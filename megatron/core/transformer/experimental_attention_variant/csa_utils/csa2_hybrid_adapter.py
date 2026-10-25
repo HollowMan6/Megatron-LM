@@ -2,8 +2,11 @@
 
 """CSA2 state lifecycle for the standard, model-independent HybridStack."""
 
+import contextlib
+import os
 from dataclasses import replace
 
+import torch
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
@@ -13,6 +16,56 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_can
 )
 from megatron.core.transformer.hyper_connection import SinglePassMHCState
 from megatron.core.transformer.stateful_module import _checkpoint_contexts
+
+
+class _PinnedResidual:
+    """A checkpoint input parked in pinned host memory until its backward replay.
+
+    Full recompute on the CSA2 path checkpoints every stack slot, so each slot keeps
+    its residual input alive until backward. With mHC that input is
+    ``[tokens, 1, streams * hidden]`` -- the single largest per-token term of the
+    activation footprint (40 KB/token with four residual streams), and the term
+    that decides whether a 512K context fits. The tensor is read exactly once, by
+    the replay, so it can wait in host memory instead of on the device.
+    """
+
+    __slots__ = ("cpu", "dtype", "shape", "device")
+
+    def __init__(self, tensor: torch.Tensor):
+        self.cpu = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+        self.cpu.copy_(tensor, non_blocking=False)
+        self.dtype = tensor.dtype
+        self.shape = tensor.shape
+        self.device = tensor.device
+
+    def restore(self) -> torch.Tensor:
+        out = torch.empty(self.shape, dtype=self.dtype, device=self.device)
+        out.copy_(self.cpu, non_blocking=True)
+        return out
+
+
+def _residual_offload_hooks(residual: torch.Tensor):
+    """Offload only ``residual``; leave the cross-layer shared tensors on device.
+
+    ``global_kv``, ``indexer_k``, ``global_indices`` and the candidate indices are
+    the *same* tensor objects across many slots, so offloading them would duplicate
+    them per slot and cost far more host traffic than it saves.
+    """
+    target = residual.data_ptr()
+
+    def pack(tensor):
+        if not isinstance(tensor, torch.Tensor) or tensor.data_ptr() != target:
+            return tensor
+        return _PinnedResidual(tensor)
+
+    def unpack(obj):
+        return obj.restore() if isinstance(obj, _PinnedResidual) else obj
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
+
+
+def _residual_offload_enabled() -> bool:
+    return os.environ.get("DSV41_OFFLOAD_RESIDUAL", "0") == "1"
 
 
 class CSA2HybridAdapter:
@@ -125,17 +178,25 @@ class CSA2HybridAdapter:
                 None if local_mhc is None else local_mhc.pre_mix,
             )
 
-        result = checkpoint(
-            run,
-            layer_kwargs["hidden_states"],
-            state.global_kv,
-            state.indexer_k,
-            state.global_indices,
-            None if state.candidates is None else state.candidates.indices,
-            None if mhc_state is None else mhc_state.pre_mix,
-            use_reentrant=False,
-            context_fn=_checkpoint_contexts,
-        )
+        residual = layer_kwargs["hidden_states"]
+        offload = _residual_offload_enabled()
+        hooks = _residual_offload_hooks(residual) if offload else contextlib.nullcontext()
+        with hooks:
+            result = checkpoint(
+                run,
+                residual,
+                state.global_kv,
+                state.indexer_k,
+                state.global_indices,
+                None if state.candidates is None else state.candidates.indices,
+                None if mhc_state is None else mhc_state.pre_mix,
+                use_reentrant=False,
+                context_fn=_checkpoint_contexts,
+            )
+        if offload:
+            # The caller rebuilds this mapping every slot; dropping the entry now is
+            # what releases the device buffer while the residual waits in host memory.
+            layer_kwargs.pop("hidden_states", None)
         state.global_kv, state.indexer_k, state.global_indices, candidate_indices, pre_mix = result[
             1:
         ]
