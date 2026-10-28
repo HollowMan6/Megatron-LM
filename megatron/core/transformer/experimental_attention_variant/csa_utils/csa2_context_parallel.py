@@ -36,14 +36,29 @@ class _LeftBoundaryExchange(torch.autograd.Function):
     """Exchange one neighbor's fixed halo and return its gradients to the owner."""
 
     @staticmethod
-    def forward(ctx, hidden: Tensor, halo_rows: int, cp_group: dist.ProcessGroup) -> Tensor:
-        """Exchange the local tail with the next rank and receive the left halo."""
+    def forward(
+        ctx,
+        hidden: Tensor,
+        halo_rows: int,
+        cp_group: dist.ProcessGroup,
+        chunk_tape=None,
+        chunk_slot: int = -1,
+    ) -> Tensor:
+        """Exchange the local tail with the next rank and receive the left halo.
+
+        ``chunk_tape``/``chunk_slot`` carry the tail across an outer-sequence chunk
+        boundary: the last rank of pass g-1 publishes its tail, and rank 0 of pass g
+        consumes it instead of its own left neighbour. Both default to a no-op, so the
+        unchunked path is untouched.
+        """
         if hidden.shape[0] < halo_rows:
             raise ValueError("CSA2 CP local rows must cover the attention halo")
         rank, size = cp_group.rank(), cp_group.size()
         ctx.cp_group = cp_group
         ctx.halo_rows = halo_rows
         ctx.input_shape = hidden.shape
+        ctx.chunk_tape = chunk_tape
+        ctx.chunk_slot = chunk_slot
         boundary = hidden.new_zeros((halo_rows,) + hidden.shape[1:])
         ops = []
         if rank > 0:
@@ -61,6 +76,16 @@ class _LeftBoundaryExchange(torch.autograd.Function):
             )
         for request in dist.batch_isend_irecv(ops):
             request.wait()
+        if chunk_tape is not None:
+            if rank == size - 1:
+                chunk_tape.ship_tail(chunk_slot, hidden[-halo_rows:])
+            if rank == 0:
+                prior = chunk_tape.tail_from_previous(chunk_slot)
+                if prior is not None:
+                    # Overwrite with the previous pass's tail but keep the exchange's
+                    # backward node alive: rank 1 still sends a gradient that has to land
+                    # somewhere, and `boundary * 0` preserves that path.
+                    boundary = prior.to(boundary.dtype) + boundary * 0
         return boundary
 
     @staticmethod
@@ -89,8 +114,24 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         group = ctx.cp_group
         rank, size = group.rank(), group.size()
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
+        chunk_tape = getattr(ctx, "chunk_tape", None)
+        if chunk_tape is not None and rank == 0:
+            # Rank 0 consumed the previous pass's tail; hand that gradient back to the
+            # rank that produced it (the last rank of the previous pass).
+            chunk_tape.ship_tail_grad(ctx.chunk_slot, grad_boundary)
+
+        def _finish():
+            # The next pass's rank 0 consumed our tail, so its gradient belongs on our tail.
+            if chunk_tape is not None and rank == size - 1:
+                later = chunk_tape.tail_grad_from_next(ctx.chunk_slot)
+                if later is not None:
+                    grad_input[-ctx.halo_rows :] = grad_input[-ctx.halo_rows :] + later.to(
+                        grad_input.dtype
+                    )
+            return grad_input, None, None, None, None
+
         if size == 1:
-            return grad_input, None, None
+            return _finish()
         if _halo_xchg_mode() == "p2p":
             ops = []
             if rank > 0:
@@ -112,13 +153,13 @@ class _LeftBoundaryExchange(torch.autograd.Function):
                 request.wait()
             if received is not None:
                 grad_input[-ctx.halo_rows :] = received
-            return grad_input, None, None
+            return _finish()
         halo = grad_boundary.contiguous()
         gathered = halo.new_empty((size,) + tuple(halo.shape))
         dist.all_gather_into_tensor(gathered, halo, group=group)
         if rank + 1 < size:
             grad_input[-ctx.halo_rows :] = gathered[rank + 1]
-        return grad_input, None, None
+        return _finish()
 
 
 class _HaloGrad(torch.autograd.Function):
@@ -243,6 +284,26 @@ class CSA2CPCompressionLayout:
         """Select each group's unique owner, retaining the all-gather autograd edge."""
         if gathered.shape[0] != self.local.cp_size * self.local.capacity:
             raise ValueError("CSA2 gathered K must match the rank-major compression capacity")
+        import os as _os
+
+        if _os.environ.get("DSV41_TSM_DEBUG", "0") == "1":
+            # The next op is index_select, whose overrun only surfaces as an opaque device
+            # assert inside ATen's gather kernel; check it here while it is a Python fact.
+            _gi = self.gather_indices
+            _mx = int(_gi.max().item()) if _gi.numel() else -1
+            print(
+                f"[tsm] gathered={tuple(gathered.shape)} indices={tuple(_gi.shape)} "
+                f"idx_max={_mx} in_range={_mx < gathered.shape[0]} "
+                f"local_cp={self.local.cp_size} cap={self.local.capacity} "
+                f"chunk={getattr(self.local, 'chunk_index', -1)}/"
+                f"{getattr(self.local, 'chunk_count', -1)}",
+                flush=True,
+            )
+            if _mx >= gathered.shape[0]:
+                raise ValueError(
+                    f"CSA2 gather index {_mx} outside {gathered.shape[0]} rows "
+                    f"(capacity={self.local.capacity}, cp_size={self.local.cp_size})"
+                )
         output = gathered.index_select(0, self.gather_indices)
         invalid = ~self.global_layout.valid_groups.reshape(-1, *([1] * (gathered.ndim - 1)))
         return output.masked_fill(invalid, 0)

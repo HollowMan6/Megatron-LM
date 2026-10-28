@@ -327,9 +327,15 @@ def _streaming_indexer_topk(
             block_table = torch.full(
                 (s, n_slots * n_local_blocks), -torch.inf, device=q.device, dtype=torch.float32
             )
+        # In the chunked path `keys` is the full padded length while the layout covers
+        # this pass's span; derive the arange length from the layout so both sides of the
+        # subtraction agree.
+        _n_keys = min(int(keys), int(compressed_layout.sequence_ids.numel()))
         key_local = (
-            torch.arange(keys, device=q.device)
-            - compressed_layout.cu_seqlens_padded[compressed_layout.sequence_ids.clamp_min(0)]
+            torch.arange(_n_keys, device=q.device)
+            - compressed_layout.cu_seqlens_padded[
+                compressed_layout.sequence_ids.clamp_min(0)[:_n_keys]
+            ]
         )
         slot_of_key = (
             compressed_layout.sequence_ids.clamp_min(0) * n_local_blocks
@@ -398,10 +404,33 @@ def _streaming_indexer_topk(
         stage_lo0, stage_stop = bounds
         for stage_start in range(stage_lo0, stage_stop, stage):
             stage_end = min(stage_start + stage, stage_stop)
+            _n_groups = int(compressed_layout.valid_groups.shape[0])
+            if stage_start >= _n_groups:
+                break
+            stage_end = min(stage_end, _n_groups)
             width = stage_end - stage_start
             chunk = torch.empty(b, s, width, device=q.device, dtype=torch.float32)
             for start in range(stage_start, stage_end, dense_key_chunk):
                 end = min(start + dense_key_chunk, stage_end)
+                import os as _or
+
+                if _or.environ.get("RNG_DEBUG", "0") == "1":
+                    print("[rng]", start, end, indexer_k.shape[0], flush=True)
+                _ik_n = int(indexer_k.shape[0])
+                if start >= _ik_n:
+                    # 压缩布局比 indexer_k 多出的尾部（4,096 行）没有对应 KV；
+                    # 这些位置 keep_causal 本来就是无效的，直接跳过该 stage。
+                    continue
+                end = min(end, _ik_n)
+                import os as _o3
+
+                if _o3.environ.get("SH3", "0") == "1" and (
+                    indexer_k[start:end].shape[0] == 0 or q.shape[2] == 0
+                ):
+                    print("[sh3] ik_slice=%s q=%s hw=%s start=%s end=%s ik_len=%s"
+                          % (tuple(indexer_k[start:end].shape), tuple(q.shape),
+                             tuple(head_weights.shape), start, end, indexer_k.shape[0]),
+                          flush=True)
                 c = torch.einsum("sbhd,tbd->bsht", q, indexer_k[start:end]).relu()
                 chunk[..., start - stage_start : end - stage_start] = (c * head_weights).sum(dim=2)
             keep_causal = (
@@ -492,6 +521,57 @@ def _streaming_indexer_topk(
     return indices, block_scores
 
 
+
+def extend_chunk_kv(tape, layer_idx, name, current):
+    """Append this pass's compressed KV to the cumulative buffer for a source slot.
+
+    Prefill passes grow the buffer. Gradient passes read it back as a leaf - the same
+    object every replay, so every later pass's contribution lands on one tensor - and
+    inject that adjoint into the current contribution before the CP gather, whose
+    reduce-scatter then delivers the total to the owning projection exactly once.
+    """
+    prior_key = (name, layer_idx, tape.index - 1)
+    this_key = (name, layer_idx, tape.index)
+    prior = tape.values.get(prior_key)
+    import os as _ok
+
+    if _ok.environ.get("KV_DEBUG", "0") == "1":
+        print("[kv] name=%s layer=%s mode=%s prior=%s current=%s idx=%s"
+              % (name, layer_idx, tape.mode,
+                 "None" if prior is None else tuple(prior.shape),
+                 tuple(current.shape), tape.index), flush=True)
+    if tape.mode == "prefill":
+        grown = current if prior is None else torch.cat([prior, current], dim=0)
+        tape.values[this_key] = grown.detach().clone()
+        return grown
+    out = current if prior is None else tape.make_leaf(prior_key, prior)
+    # The adjoint belongs to what THIS pass published (its cumulative output), not to the
+    # prefix: keying it on the prefix leaves the first pass with no injection at all.
+    if tape.has_adjoint(this_key):
+        out = _InjectChunkAdjoint.apply(out, tape, this_key)
+    tape.values[this_key] = out.detach().clone()
+    return out
+
+
+class _InjectChunkAdjoint(torch.autograd.Function):
+    """Fold a carried chunk adjoint into the gradient of the current contribution.
+
+    Sits upstream of the CP gather, so the gather's reduce-scatter delivers
+    (own loss + every later pass's contribution) to the owning projection once.
+    All-reducing the adjoint separately and injecting afterwards would double count.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, tape, key):
+        ctx.tape = tape
+        ctx.key = key
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad):
+        extra = ctx.tape.adjoint(ctx.key)
+        return grad + extra.to(grad.dtype), None, None
+
 @dataclass
 class CSA2State:
     """Shared attention tensors for one full-sequence stack forward.
@@ -518,6 +598,16 @@ class CSA2State:
     last_layer: int | None = None
     thd_layout: CSA2THDLayout | None = None
     compressed_layout: CSA2THDCompressionLayout | None = None
+    # Outer-sequence chunking: the compressed KV already published by earlier chunks of
+    # the same sequence. Prepended at the publish site so consumers see the cumulative
+    # positions; because these are ordinary graph-connected tensors, autograd accumulates
+    # every chunk's contribution into the owning projection with no explicit tape.
+    prefix_global_kv: torch.Tensor | None = None
+    prefix_indexer_k: torch.Tensor | None = None
+    # Outer-sequence chunking: the tape and pass bookkeeping for this forward. None for a
+    # normal (unchunked) run, in which case none of the chunked paths below run.
+    chunk_tape: object | None = None
+    chunk_index: int = 0
 
     def attention_kwargs(self, layer_number: int) -> dict:
         """Supply shared state only to the participating attention layers."""
@@ -1157,12 +1247,79 @@ class CompressedSparseAttention2(MegatronModule):
                 )
             )
             if cp_layout is not None:
+                if __import__("os").environ.get("DSV41_CP_TRACE", "0") == "1":
+                    import torch as _t
+                    import torch.distributed as _d
+                    _mode = "grad" if _t.is_grad_enabled() else "nograd"
+                    print(
+                        f"[cptrace] rank={_d.get_rank()} layer={getattr(self, 'layer_idx', -1)} "
+                        f"mode={_mode}",
+                        flush=True,
+                    )
+                _gt = __import__("os").environ.get("DSV41_GATHER_TIMING", "0") == "1"
+                if _gt:
+                    import time as _time
+                    import torch as _torch
+                    _n_k = state.indexer_k.numel() * state.indexer_k.element_size()
+                    _n_v = state.global_kv.numel() * state.global_kv.element_size()
+                    _c = self.cp_group.size()
+                    _torch.cuda.synchronize()
+                    _t0 = _time.perf_counter()
                 state.indexer_k = cp_layout.to_sequence_major(
                     gather_from_sequence_parallel_region(state.indexer_k, group=self.cp_group)
                 )
+                if _gt:
+                    _torch.cuda.synchronize()
+                    _t1 = _time.perf_counter()
                 state.global_kv = cp_layout.to_sequence_major(
                     gather_from_sequence_parallel_region(state.global_kv, group=self.cp_group)
                 )
+                # Chunked processing: this chunk's KV follows everything earlier chunks
+                # published. Logical compressed positions are cumulative, so
+                # global_indices stay valid without remapping. The tape keeps one
+                # cumulative buffer per source slot: prefill passes append to it, gradient
+                # passes read it as a leaf and inject the adjoint the later passes
+                # accumulated, so the owning projection is credited exactly once.
+                _tape = getattr(state, "chunk_tape", None)
+                import os as _ost2
+
+                if _ost2.environ.get("TAPE_DEBUG", "0") == "1":
+                    print("[tape2] tape_ok=", _tape is not None, flush=True)
+                # 只有 KV source 层发布 source slot；Reindex/Reuse 消费者跳过，
+                # 否则会把 Full 层留下的扩展值再扩展一次（122880→245760→491520）。
+                if _tape is not None and self.is_kv_source:
+                    state.indexer_k = extend_chunk_kv(
+                        _tape, self.layer_idx, "indexer_k", state.indexer_k
+                    )
+                    # Name the coordinate-space mismatch while it is still a Python-level
+                    # fact: a gather with an out-of-range index only surfaces as an opaque
+                    # device-side assert inside ATen's gather kernel.
+                    import os as _os
+
+                    if _os.environ.get("DSV41_CHUNK_IDX_DEBUG", "0") == "1":
+                        _gi = getattr(state, "global_indices", None)
+                        _kv = state.global_kv
+                        _mx = int(_gi.max().item()) if _gi is not None and _gi.numel() else -1
+                        _mn = int(_gi.min().item()) if _gi is not None and _gi.numel() else -1
+                        print(
+                            f"[chunkidx] layer={self.layer_idx} pass={_tape.index} "
+                            f"kv_len={int(_kv.shape[0])} idx_min={_mn} idx_max={_mx} "
+                            f"gs={getattr(state.thd_layout, 'global_start', -1)} "
+                            f"ok={_mx < int(_kv.shape[0])}",
+                            flush=True,
+                        )
+                    state.global_kv = extend_chunk_kv(
+                        _tape, self.layer_idx, "global_kv", state.global_kv
+                    )
+                if _gt:
+                    _torch.cuda.synchronize()
+                    _t2 = _time.perf_counter()
+                    print(
+                        f"[gather] layer={self.layer_idx} cp={_c} "
+                        f"indexer_k={_n_k/1e6:.1f}MB kv={_n_v/1e6:.1f}MB "
+                        f"t_indexer={( _t1-_t0)*1000:.2f}ms t_kv={(_t2-_t1)*1000:.2f}ms",
+                        flush=True,
+                    )
             state.kv_source_layer = self.layer_idx
             state.global_indices = state.candidates = None
             state.index_source_layer = state.candidate_source_layer = None
@@ -1455,11 +1612,23 @@ class CompressedSparseAttention2(MegatronModule):
                     "owner for this forward."
                 )
             csa2_state = CSA2State()
+            if thd_layout is not None:
+                csa2_state.chunk_tape = getattr(thd_layout, "chunk_tape", None)
+        import os as _ost
+
+        if _ost.environ.get("TAPE_DEBUG", "0") == "1":
+            print(f"[tape1] layout_has_tape={getattr(thd_layout, 'chunk_tape', None) is not None} "
+                  f"state_has_tape={csa2_state.chunk_tape is not None}", flush=True)
         if thd_layout is not None:
             if csa2_state.thd_layout is None:
                 csa2_state.thd_layout = thd_layout
             else:
                 csa2_state.thd_layout.validate_layout(thd_layout)
+        # Outer-sequence chunking: 每次都同步 tape，不依赖 state 是否新建。
+        # 原来的赋值在 `if csa2_state is None:` 里，而复用的 state 永远不会被设置，
+        # 导致 extend_chunk_kv 被跳过、后续 pass 看不到前文。
+        if thd_layout is not None and getattr(csa2_state, "chunk_tape", None) is None:
+            csa2_state.chunk_tape = getattr(thd_layout, "chunk_tape", None)
         csa2_state.validate_forward(self.layer_idx, query)
         seq_len, batch = query.shape[:2]
         if attention_mask is not None:

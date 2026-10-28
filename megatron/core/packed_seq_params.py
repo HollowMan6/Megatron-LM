@@ -32,6 +32,13 @@ class PackedSeqParams:
     pad_between_seqs: bool = None
     cp_scatter_cache: object = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    # Outer-sequence chunking: which pass of a K-way temporal split this is, and how
+    # many there are. Defaults describe the unchunked run.
+    cp_chunk_index: int = 0
+    cp_chunk_count: int = 1
+    # Outer-sequence chunking: the tape carrying state between passes. Opaque here; the
+    # layout and CSA2State only need to hand it along. None for an unchunked run.
+    chunk_tape: object = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

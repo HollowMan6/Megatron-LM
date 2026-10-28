@@ -190,7 +190,11 @@ class DeepSeekV41Model(HybridModel):
             )
         halo = self.engram_hash.layout.max_ngram_size - 1
         if halo > input_ids.shape[1]:
-            raise ValueError("Engram CP requires at least one local n-gram prefix")
+            raise ValueError(
+                f"Engram CP requires at least one local n-gram prefix "
+                f"(halo={halo}, local_len={input_ids.shape[1]}, "
+                f"input_ids={tuple(input_ids.shape)}, cp={cp_group.size()})"
+            )
         gathered_ids = torch.empty(
             cp_group.size() * halo, device=input_ids.device, dtype=input_ids.dtype
         )
@@ -206,6 +210,20 @@ class DeepSeekV41Model(HybridModel):
         prefix_mask = gathered_mask[prior : prior + halo].bool()
         if cp_group.rank() == 0:
             prefix_mask = torch.zeros_like(prefix_mask)
+        # Outer-sequence chunking: at a chunk boundary the n-gram prefix belongs to the last
+        # rank of the previous pass, not to this pass's physical left neighbour. The gather
+        # above still runs on every rank (it is a collective); only the values are replaced.
+        _chunk_tape = getattr(packed_seq_params, "chunk_tape", None)
+        if _chunk_tape is not None:
+            if cp_group.rank() == cp_group.size() - 1:
+                _chunk_tape.ship_tail("engram_ids", input_ids[0, -halo:])
+                _chunk_tape.ship_tail("engram_mask", token_mask[0, -halo:].to(torch.uint8))
+            if cp_group.rank() == 0 and _chunk_tape.index > 0:
+                _prev_ids = _chunk_tape.tail_from_previous("engram_ids")
+                _prev_mask = _chunk_tape.tail_from_previous("engram_mask")
+                if _prev_ids is not None and _prev_mask is not None:
+                    prefix_ids = _prev_ids.to(prefix_ids.dtype)
+                    prefix_mask = _prev_mask.bool()
         rows = torch.arange(input_ids.shape[1] + halo, device=input_ids.device)
         rows = rows + layout.global_start - halo
         sequence_ids, _, valid = get_thd_token_metadata(

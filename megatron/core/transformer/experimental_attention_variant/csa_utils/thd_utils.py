@@ -104,13 +104,15 @@ def get_thd_compressed_group_indices(
     return gather_idx, local_pos, batch_ids, valid_comp
 
 
-def _check_values(condition: torch.Tensor, message: str) -> None:
-    """Validate device metadata without transferring CUDA scalars to the host."""
-    if condition.is_cuda:
-        torch._assert_async(condition, message)
-    elif not bool(condition):
-        raise ValueError(message)
+def _check_values(condition, message):
+    """Host-side check on tiny metadata tensors; raises with the condition's own message.
 
+    Deliberately synchronous: an async device assert reports whichever frame happens to sync
+    next, which hides the check that actually failed.
+    """
+    ok = bool(condition.item()) if hasattr(condition, "item") else bool(condition)
+    if not ok:
+        raise ValueError(message)
 
 def get_thd_token_metadata(
     cu_seqlens: Tensor, cu_seqlens_padded: Tensor, global_rows: Tensor
@@ -180,14 +182,34 @@ class CSA2THDLayout:
     cp_rank: int = 0
     cp_size: int = 1
 
+    # Outer-sequence chunking carrier; opaque to the layout itself.
+    chunk_tape: object = None
+    # Which pass of a K-way temporal split this layout describes. `cp_size` deliberately
+    # stays PHYSICAL: it is also the rank count of the all-gather over the compressed KV, and
+    # only the window offset may follow the virtual geometry.
+    chunk_index: int = 0
+    chunk_count: int = 1
+
     @property
     def global_start(self) -> int:
-        """First global physical token row owned by this contiguous CP partition."""
-        return self.cp_rank * self.total_tokens
+        """First global physical token row owned by this pass on this rank.
+
+        Under outer-sequence chunking pass g of K owns the rows a wider CP group would give
+        to virtual rank g*cp_size + cp_rank, so the offset advances by one group per pass
+        while `cp_size` (and therefore every gather shape) stays physical.
+        """
+        virtual_rank = self.chunk_index * self.cp_size + self.cp_rank
+        return virtual_rank * self.total_tokens
 
     @property
     def global_total_tokens(self) -> int:
-        """Physical capacity across all equal-sized CP partitions."""
+        """Physical capacity across the equal-sized CP partitions.
+
+        Deliberately NOT multiplied by ``chunk_count``: callers derive the CP width as
+        ``global_total_tokens / total_tokens``, and a virtual width there builds gather
+        indices for a group twice as wide as the physical all-gather produces. The bounds
+        check that must span the passes computes its own capacity.
+        """
         return self.cp_size * self.total_tokens
 
     def for_compression(self, ratio: int) -> CSA2THDCompressionLayout:
@@ -284,7 +306,16 @@ def build_csa2_thd_layout(
     cp_group: torch.distributed.ProcessGroup | None = None,
 ) -> CSA2THDLayout:
     """Memoised wrapper; see :func:`_build_csa2_thd_layout` for the semantics."""
-    key = (id(packed_seq_params), total_tokens, id(cp_group))
+    # The chunk index is part of the identity: the driver reuses one
+    # PackedSeqParams across passes, so keying on object identity alone would
+    # return pass g-1's layout for pass g.
+    key = (
+        id(packed_seq_params),
+        total_tokens,
+        id(cp_group),
+        getattr(packed_seq_params, "cp_chunk_index", 0),
+        getattr(packed_seq_params, "cp_chunk_count", 1),
+    )
     hit = _THD_LAYOUT_CACHE.get(key)
     if hit is not None:
         ref_psp, ref_group, layout = hit
@@ -322,13 +353,30 @@ def _build_csa2_thd_layout(
         raise ValueError("CSA2 THD total_tokens must be a non-negative integer")
     group = packed_seq_params.cp_group if packed_seq_params.cp_group is not None else cp_group
     cp_size, cp_rank = (group.size(), group.rank()) if group is not None else (1, 0)
+    # Virtual geometry for outer-sequence chunking: this pass covers a later slice of
+    # the same sequence, which in the layout arithmetic is exactly what a rank with a
+    # larger index in a wider CP group would cover. Collectives stay on the physical
+    # group; only global_start / global_total follow the virtual geometry.
+    _chunk_count = getattr(packed_seq_params, "cp_chunk_count", 1) or 1
+    _chunk_index = getattr(packed_seq_params, "cp_chunk_index", 0) or 0
+    if _chunk_count > 1 and not 0 <= _chunk_index < _chunk_count:
+        raise ValueError("CSA2 THD chunk index outside the chunk count")
     if packed_seq_params.local_cp_size not in (None, cp_size):
         raise ValueError("CSA2 THD local_cp_size requires a matching explicit CP group")
     if cp_size < 1 or not 0 <= cp_rank < cp_size:
         raise ValueError("CSA2 THD requires valid CP group membership")
     if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
         raise ValueError("CSA2 THD CP requires a contiguous partition")
-    global_total = total_tokens * cp_size
+    # Outer-sequence chunking: the passes together cover `chunk_count` CP groups' worth of
+    # rows, and the packing can pad past the tiling, so the capacity this check enforces must
+    # span max(tiled, actual cumulative length). A plain `total_tokens * cp_size` rejected
+    # every pass after the first by the padding remainder.
+    _chunk_count = getattr(packed_seq_params, "cp_chunk_count", 1) or 1
+    global_total = total_tokens * cp_size * _chunk_count
+    try:
+        global_total = max(global_total, int(packed_seq_params.cu_seqlens_q[-1].item()))
+    except Exception:
+        pass
 
     cu_q = packed_seq_params.cu_seqlens_q
     cu_kv = packed_seq_params.cu_seqlens_kv
@@ -353,7 +401,19 @@ def _build_csa2_thd_layout(
         _check_values(
             prefix[-1] <= global_total, "CSA2 THD metadata exceeds physical token capacity"
         )
-    _check_values((cu_q == cu_kv).all(), "CSA2 THD self-attention requires equal query/KV lengths")
+    if not torch.equal(cu_q.cpu(), cu_kv.cpu()):
+        # Name the divergence instead of dying inside a device-side assert: this is a
+        # host-side comparison of two small metadata tensors, so it costs nothing.
+        _q, _k = cu_q.cpu(), cu_kv.cpu()
+        _bad = int((_q != _k).nonzero()[0]) if (_q != _k).any() else -1
+        raise ValueError(
+            "CSA2 THD cu_seqlens_q != cu_seqlens_kv at index "
+            f"{_bad}: q={_q[max(0, _bad - 2): _bad + 3].tolist()} "
+            f"kv={_k[max(0, _bad - 2): _bad + 3].tolist()} "
+            f"n_q={_q.numel()} n_kv={_k.numel()} total_tokens={total_tokens} "
+            f"chunk={getattr(packed_seq_params, 'cp_chunk_index', 0)}/"
+            f"{getattr(packed_seq_params, 'cp_chunk_count', 1)}"
+        )
     _check_values(
         (physical_q == physical_kv).all(),
         "CSA2 THD self-attention requires equal query/KV physical lengths",
@@ -393,4 +453,7 @@ def _build_csa2_thd_layout(
         valid_tokens=valid_tokens,
         cp_rank=cp_rank,
         cp_size=cp_size,
+        chunk_tape=getattr(packed_seq_params, "chunk_tape", None),
+        chunk_index=_chunk_index,
+        chunk_count=_chunk_count,
     )
