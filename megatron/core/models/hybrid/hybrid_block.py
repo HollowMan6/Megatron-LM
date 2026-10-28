@@ -55,7 +55,9 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
+    first_local_layer_index,
     make_sharded_tensors_for_checkpoint,
+    resolve_gradient_boundary,
     sharded_state_dict_default,
 )
 from megatron.core.transformer.wide_residual_layer import (
@@ -612,6 +614,9 @@ class HybridStack(MegatronModule):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+        self._gradient_boundary_resolved = resolve_gradient_boundary(self, hidden_states)
+        _, gradient_boundary_layer = self._gradient_boundary_resolved
+        first_local_layer = first_local_layer_index(self.layers)
 
         forward_context = forward_context or HybridStackForwardContext()
         if self.forward_adapter is not None:
@@ -713,6 +718,13 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
+                # A boundary before this stage means trainable layers upstream, so the
+                # input keeps its graph; otherwise the graph is cut where it starts.
+                gradient_boundary_applied = (
+                    gradient_boundary_layer is None
+                    or first_local_layer is None
+                    or gradient_boundary_layer < first_local_layer
+                )
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
                         self._execution_layer_indices,
@@ -722,7 +734,18 @@ class HybridStack(MegatronModule):
                     )
                 ):
                     layer_packed_seq_params = packed_seq_params
-                    mhc_manager = mhc_layer_managers[layer_idx]
+                    layer_at_or_after_boundary = (
+                        gradient_boundary_applied
+                        or gradient_boundary_layer is None
+                        or layer.layer_number - 1 >= gradient_boundary_layer
+                    )
+                    if layer_at_or_after_boundary and not gradient_boundary_applied:
+                        hidden_states = hidden_states.detach()
+                        forward_context.detach_for_backward()
+                        gradient_boundary_applied = True
+                    mhc_manager = (
+                        mhc_layer_managers[layer_idx] if layer_at_or_after_boundary else None
+                    )
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
                     layer_cp_metadata = (
@@ -733,18 +756,22 @@ class HybridStack(MegatronModule):
                     )
 
                     if isinstance(layer, ShortcutMoEBlock):
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                            packed_seq_params=layer_packed_seq_params,
-                            padding_mask=padding_mask,
-                            quant_context_factory=get_inner_quant_context,
-                            cp_layout_state=cp_layout_state,
-                            packed_sequence_cp_metadata=layer_cp_metadata,
+                        gradient_context = (
+                            nullcontext() if layer_at_or_after_boundary else torch.no_grad()
                         )
+                        with gradient_context:
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=sequence_len_offset,
+                                packed_seq_params=layer_packed_seq_params,
+                                padding_mask=padding_mask,
+                                quant_context_factory=get_inner_quant_context,
+                                cp_layout_state=cp_layout_state,
+                                packed_sequence_cp_metadata=layer_cp_metadata,
+                            )
                     else:
                         if cp_layout_state is not None:
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
@@ -756,7 +783,10 @@ class HybridStack(MegatronModule):
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
                         )
-                        with inner_quant_context:
+                        gradient_context = (
+                            nullcontext() if layer_at_or_after_boundary else torch.no_grad()
+                        )
+                        with inner_quant_context, gradient_context:
                             if self.forward_adapter is not None:
                                 hidden_states = self.forward_adapter.before_layer(
                                     layer, hidden_states, forward_context
@@ -785,7 +815,7 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["mhc_state"] = forward_context.mhc_state
                                 if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = input_ids
-                                if use_stateful_full_recompute:
+                                if use_stateful_full_recompute and layer_at_or_after_boundary:
                                     hidden_states, _ = self.forward_adapter.checkpoint_layer(
                                         layer, layer_kwargs, forward_context
                                     )
@@ -820,6 +850,11 @@ class HybridStack(MegatronModule):
                         hidden_states=hidden_states,
                         is_block_end=mhc_block_ends[layer_idx],
                     )
+
+                if not gradient_boundary_applied:
+                    # Every layer here lies before the boundary; see TransformerBlock.forward.
+                    hidden_states = hidden_states.detach()
+                    forward_context.detach_for_backward()
 
         if self.residual_stream_readout is not None:
             hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
