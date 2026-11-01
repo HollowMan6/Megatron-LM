@@ -215,9 +215,10 @@ class DeepSeekV41Model(HybridModel):
         # above still runs on every rank (it is a collective); only the values are replaced.
         _chunk_tape = getattr(packed_seq_params, "chunk_tape", None)
         if _chunk_tape is not None:
-            if cp_group.rank() == cp_group.size() - 1:
-                _chunk_tape.ship_tail("engram_ids", input_ids[0, -halo:])
-                _chunk_tape.ship_tail("engram_mask", token_mask[0, -halo:].to(torch.uint8))
+            # The existing gather already replicated the producer's tail. Store it
+            # on rank 0 too, where the next pass consumes its n-gram prefix.
+            _chunk_tape.ship_tail("engram_ids", gathered_ids[-halo:])
+            _chunk_tape.ship_tail("engram_mask", gathered_mask[-halo:])
             if cp_group.rank() == 0 and _chunk_tape.index > 0:
                 _prev_ids = _chunk_tape.tail_from_previous("engram_ids")
                 _prev_mask = _chunk_tape.tail_from_previous("engram_mask")

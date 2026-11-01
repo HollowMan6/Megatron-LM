@@ -329,8 +329,16 @@ class DSv4HybridAttention(Attention):
         boundary_hidden = None
         if thd_layout is not None and thd_layout.cp_size > 1:
             halo_rows = max(self.config.csa_window_size - 1, self._dsv4_compress_ratio)
+            # Hand the chunk tape in: exchange_csa2_boundary_hidden otherwise leaves rank 0
+            # with a zero halo boundary, because the row it needs lives in the PREVIOUS pass,
+            # not on the neighbouring rank. Without it pass 1 starts from a zeroed boundary and
+            # every row near the pass cut sees a different prefix than it does under K=1.
             boundary_hidden = exchange_csa2_boundary_hidden(
-                hidden_states, halo_rows, self.pg_collection.cp
+                hidden_states,
+                halo_rows,
+                self.pg_collection.cp,
+                chunk_tape=getattr(thd_layout, "chunk_tape", None),
+                chunk_slot=self.layer_number,
             )
             rows = torch.arange(halo_rows, device=hidden_states.device)
             rows = rows + thd_layout.global_start - halo_rows

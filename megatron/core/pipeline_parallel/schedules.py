@@ -9,6 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.memory_profile import phase as memory_profile_phase
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -558,6 +559,7 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+    memory_profile_phase(f"forward_pass_{current_microbatch if current_microbatch is not None else 'unknown'}")
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
@@ -577,15 +579,18 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # needs to be modified slightly to support arbitrary numbers of skip
     # connections.
 
+    memory_profile_phase("backward_start")
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
 
     # Typed P2P returns raw payloads and gradient tuples; all outputs share one backward.
     if isinstance(input_tensor, PipelinePayload) or isinstance(output_tensor, PipelinePayload):
         try:
-            return backward_pipeline_payload(
+            result = backward_pipeline_payload(
                 input_tensor, output_tensor, output_tensor_grad, config.grad_scale_func
             )
+            memory_profile_phase("backward_end")
+            return result
         finally:
             if config.timers is not None:
                 config.timers('backward-compute').stop()
@@ -634,6 +639,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
+
+    memory_profile_phase("backward_end")
 
     return input_tensor_grad
 

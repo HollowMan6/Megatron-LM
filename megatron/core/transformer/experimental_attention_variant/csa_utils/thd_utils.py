@@ -114,6 +114,7 @@ def _check_values(condition, message):
     if not ok:
         raise ValueError(message)
 
+
 def get_thd_token_metadata(
     cu_seqlens: Tensor, cu_seqlens_padded: Tensor, global_rows: Tensor
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -221,8 +222,11 @@ class CSA2THDLayout:
         if type(ratio) is not int or ratio not in (1, 2):
             raise ValueError("CSA2 THD compression ratio must be 1 or 2")
         num_sequences = self.cu_seqlens.numel() - 1
+        # Every physical rank publishes the same cumulative coordinate space.
+        # At chunk_index=0 this is exactly the unchunked CP span.
+        span = (self.chunk_index + 1) * self.global_total_tokens
         capacity = get_thd_compressed_capacity(
-            self.global_total_tokens, self.max_seqlen, num_sequences, ratio
+            span, max(self.max_seqlen, span), num_sequences, ratio
         )
         cu_physical = get_thd_compressed_cu_seqlens(self.cu_seqlens_padded, ratio)
         sources, local_groups, sequence_ids, assigned = get_thd_compressed_group_indices(
@@ -237,13 +241,13 @@ class CSA2THDLayout:
             _, _, source_valid = get_thd_token_metadata(
                 self.cu_seqlens, self.cu_seqlens_padded, sources
             )
-        valid_groups = assigned & source_valid.all(dim=-1)
+        valid_groups = assigned & source_valid.all(dim=-1) & (sources[:, -1] < span)
         positions = (local_groups.to(torch.int64) * ratio).masked_fill(~valid_groups, 0)
         sequence_ids = sequence_ids.masked_fill(~assigned, -1)
 
         return CSA2THDCompressionLayout(
             ratio=ratio,
-            total_tokens=self.global_total_tokens,
+            total_tokens=span,
             capacity=capacity,
             max_seqlen=self.max_seqlen // ratio,
             cu_seqlens=get_thd_compressed_cu_seqlens(self.cu_seqlens, ratio),
@@ -438,8 +442,17 @@ def _build_csa2_thd_layout(
     # microbatch's in-place replacement of static cumulative-length buffers.
     cu_q = cu_q.clone()
     physical_q = physical_q.clone()
+    # The pass offset is part of the row index, not just the CP offset: global_start puts pass
+    # `chunk_index` in its own slice of the virtual CP, so its rows start at
+    # chunk_index * cp_size * total_tokens. Leaving it out gave pass 1's queries the positions
+    # of pass 0 - RoPE then rotated them against the wrong prefix, which changes log_probs
+    # while leaving every KV shape correct (measured: K=2 loss stuck at 4.1632 through tape
+    # and coordinate fixes that all kept their shapes). chunk_index is 0 for K=1, so the term
+    # vanishes there and K=1 is unchanged.
     rows = (
-        torch.arange(total_tokens, device=cu_q.device, dtype=torch.int64) + cp_rank * total_tokens
+        torch.arange(total_tokens, device=cu_q.device, dtype=torch.int64)
+        + cp_rank * total_tokens
+        + _chunk_index * cp_size * total_tokens
     )
     sequence_ids, positions, valid_tokens = get_thd_token_metadata(cu_q, physical_q, rows)
 

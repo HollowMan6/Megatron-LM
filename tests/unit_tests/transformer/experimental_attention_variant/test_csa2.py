@@ -2418,3 +2418,74 @@ def test_thd_cp_compression_keeps_global_groups_and_gradients(ratio):
     x.grad = None
     expected.sum().backward()
     torch.testing.assert_close(actual_grad, x.grad, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("chunk_index", [0, 1])
+def test_thd_cp_chunked_compression_matches_global_groups_and_gradients(chunk_index):
+    """Current CP owners plus tape history preserve global values and adjoints."""
+    from megatron.core.pipeline_parallel.chunk_tape import ChunkTape, extend_chunk_kv
+
+    class CPGroup:
+        def __init__(self, rank):
+            self._rank = rank
+
+        def rank(self):
+            return self._rank
+
+        def size(self):
+            return 2
+
+    logical = torch.tensor([0, 32], dtype=torch.int32)
+    physical = torch.tensor([0, 32], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=32,
+        max_seqlen_kv=32,
+        cp_partition_mode="contiguous",
+        cp_chunk_index=chunk_index,
+        cp_chunk_count=2,
+    )
+    x = torch.arange(32, dtype=torch.float64, requires_grad=True)
+    tape = ChunkTape(2)
+
+    def forward(index, mode):
+        tape.begin(index, mode)
+        params.cp_chunk_index = index
+        layouts, gathered_parts = [], []
+        for rank in range(2):
+            tokens = build_csa2_thd_layout(params, 8, cp_group=CPGroup(rank))
+            layout = build_csa2_cp_compression_layout(tokens, ratio=2, halo_rows=2)
+            start = tokens.global_start
+            halo = x.new_zeros(2) if start == 0 else x[start - 2 : start]
+            local = torch.cat((halo, x[start : start + 8]))
+            gathered_parts.append(local[layout.local.source_indices].mean(-1))
+            layouts.append(layout)
+        global_layout = layouts[0].global_layout
+        assert all(layout.global_layout.capacity == global_layout.capacity for layout in layouts)
+        current = layouts[0].to_sequence_major(torch.cat(gathered_parts))
+        prefix_mask = global_layout.source_indices[:, -1] < index * 16
+        actual = extend_chunk_kv(tape, 0, "global_kv", current, prefix_mask)
+        expected = (
+            x[global_layout.source_indices].mean(-1).masked_fill(~global_layout.valid_groups, 0)
+        )
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        return actual, expected
+
+    for index in range(chunk_index):
+        with torch.no_grad():
+            forward(index, "prefill")
+    actual, expected = forward(chunk_index, "grad")
+    actual.sum().backward()
+    tape.collect_all_adjoints()
+    for index in reversed(range(chunk_index)):
+        replay, _ = forward(index, "grad")
+        (replay.sum() * 0).backward()
+        tape.collect_all_adjoints()
+    actual_grad = x.grad.clone()
+    x.grad = None
+    expected.sum().backward()
+    torch.testing.assert_close(actual_grad, x.grad, atol=0, rtol=0)

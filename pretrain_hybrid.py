@@ -28,8 +28,9 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.memory_profile import phase as memory_profile_phase
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -63,9 +64,9 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import initialize_runtime_services
 from model_provider import model_provider
 
 try:
@@ -355,6 +356,9 @@ def forward_step(data_iterator, model: HybridModel):
             padding_mask=padding_mask,
             cp_batch=cp_batch,
         )
+    chunk_index = getattr(packed_seq_params, "cp_chunk_index", 0)
+    chunk_count = getattr(packed_seq_params, "cp_chunk_count", 1)
+    memory_profile_phase(f"forward_end_chunk_{chunk_index}_of_{chunk_count}")
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)

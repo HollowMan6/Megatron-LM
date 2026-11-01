@@ -12,6 +12,10 @@ from torch import Tensor
 # an element budget, so the CUDA sort workspace stays bounded.
 _SELECT_ROW_CHUNK_ELEMENTS = 1 << 24
 
+# Rolling merges hold several score/index copies. A smaller row budget bounds
+# that workspace independently of both the context length and the row count.
+_BLOCK_MERGE_ROW_ELEMENTS = 1 << 20
+
 # Mirrors csa2.py's _MASK_ROW_CHUNK_ELEMENTS: rows per row-chunk when a bool mask
 # is expanded onto a [rows, keys] slab, as a bool-element budget (1 byte per
 # element, so a 16 MiB live slab).
@@ -82,9 +86,74 @@ class CSA2CandidateBlocks:
         return out
 
 
+class CSA2BlockTopK:
+    """Rolling fp32 block winners with the full selector's stable tie order."""
+
+    def __init__(
+        self,
+        rows: int,
+        num_blocks: int,
+        topk_blocks: int,
+        block_size: int,
+        visible: Tensor,
+        device: torch.device,
+    ) -> None:
+        if topk_blocks <= 0 or block_size <= 0:
+            raise ValueError("CSA2 candidate block count and size must be positive")
+        self.num_blocks = num_blocks
+        self.topk_blocks = topk_blocks
+        self.block_size = block_size
+        self.newest = (visible.reshape(rows, 1) - 1) // block_size
+        valid = (self.newest >= 0) & (self.newest < num_blocks)
+        keep = min(topk_blocks, num_blocks)
+        self.indices = torch.full((rows, keep), num_blocks, dtype=torch.int64, device=device)
+        # Seed forcing even when no key is scored for a row.
+        self.values = torch.full((rows, keep), -torch.inf, dtype=torch.float32, device=device)
+        if keep:
+            self.indices[:, :1] = self.newest.masked_fill(~valid, num_blocks)
+            self.values[:, :1].masked_fill_(valid, torch.inf)
+
+    @torch.no_grad()
+    def update(self, scores: Tensor, block_start: int, row_mask: Tensor | None = None) -> None:
+        """Merge completed local blocks, optionally only for their sequence's rows."""
+        width = scores.shape[-1]
+        keep = min(self.topk_blocks, self.num_blocks)
+        if width == 0 or keep == 0:
+            return
+        block_ids = torch.arange(block_start, block_start + width, device=scores.device)
+        # The forced block already lives in the state; never insert it twice.
+        ids = block_ids.expand_as(scores)
+        rows_per_chunk = max(1, _BLOCK_MERGE_ROW_ELEMENTS // (width + self.values.shape[-1]))
+        out_values, out_indices = [], []
+        for start in range(0, scores.shape[0], rows_per_chunk):
+            stop = start + rows_per_chunk
+            slab = scores[start:stop].masked_fill(block_ids == self.newest[start:stop], -torch.inf)
+            values = torch.cat((self.values[start:stop], slab), dim=-1)
+            indices = torch.cat((self.indices[start:stop], ids[start:stop]), dim=-1)
+            # Packed sequences can restart local IDs. Restore ID order before
+            # stable score sorting so ties always retain the smaller block ID.
+            order = indices.argsort(dim=-1, stable=True)
+            indices = indices.gather(-1, order)
+            values = values.gather(-1, order)
+            winners = values.argsort(dim=-1, descending=True, stable=True)[..., :keep]
+            selected_values = values.gather(-1, winners)
+            selected_indices = indices.gather(-1, winners)
+            if row_mask is not None:
+                selected_values = torch.where(
+                    row_mask[start:stop, None], selected_values, self.values[start:stop]
+                )
+                selected_indices = torch.where(
+                    row_mask[start:stop, None], selected_indices, self.indices[start:stop]
+                )
+            out_values.append(selected_values)
+            out_indices.append(selected_indices)
+        self.values = torch.cat(out_values, dim=0)
+        self.indices = torch.cat(out_indices, dim=0)
+
+
 @torch.no_grad()
 def candidate_blocks_from_block_scores(
-    block_scores: Tensor, visible: Tensor | int, topk_blocks: int, block_size: int
+    block_scores: Tensor | CSA2BlockTopK, visible: Tensor | int, topk_blocks: int, block_size: int
 ) -> CSA2CandidateBlocks:
     """Rank precomputed causal block maxima (the tail of candidate_blocks_from_scores).
 
@@ -95,6 +164,16 @@ def candidate_blocks_from_block_scores(
     """
     if topk_blocks <= 0 or block_size <= 0:
         raise ValueError("CSA2 candidate block count and size must be positive")
+    if isinstance(block_scores, CSA2BlockTopK):
+        if block_scores.topk_blocks != topk_blocks or block_scores.block_size != block_size:
+            raise ValueError("CSA2 rolling candidate configuration mismatch")
+        sentinel = torch.iinfo(torch.int32).max
+        ids = block_scores.indices.masked_fill(~(block_scores.values > -torch.inf), sentinel)
+        ids = ids.sort(-1).values
+        ids = ids.masked_fill(ids == sentinel, -1).int()
+        if isinstance(visible, Tensor):
+            ids = ids.reshape(*visible.shape[:-1], ids.shape[-1])
+        return CSA2CandidateBlocks(ids, block_size)
     num_blocks = block_scores.shape[-1]
     newest = (visible - 1) // block_size
     block_scores = block_scores.masked_fill(

@@ -3,7 +3,6 @@
 """CSA2 local compression and canonical shared-K addressing on the DSv4 CP path."""
 
 import math
-import os
 from dataclasses import dataclass
 
 import torch
@@ -11,18 +10,6 @@ import torch.distributed as dist
 from torch import Tensor
 
 from .thd_utils import CSA2THDCompressionLayout, CSA2THDLayout
-
-
-def _halo_xchg_mode() -> str:
-    """Select how the CSA2 CP halo gradient is exchanged in the backward pass.
-
-    ``allgather`` (default) uses one group-wide all-gather; ``p2p`` keeps the
-    original directed ring. The ring is cheaper in bytes but makes every rank wait
-    for a single neighbour, which can close a cross-communicator deadlock cycle with
-    the MoE dispatcher's device-to-host split synchronisation on long-context
-    context-parallel runs. See ``_LeftBoundaryExchange.backward``.
-    """
-    return "p2p" if os.environ.get("DSV41_HALO_XCHG", "").strip().lower() == "p2p" else "allgather"
 
 
 def get_cp_compressor_capacity(local_rows: int, ratio: int) -> int:
@@ -44,13 +31,7 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         chunk_tape=None,
         chunk_slot: int = -1,
     ) -> Tensor:
-        """Exchange the local tail with the next rank and receive the left halo.
-
-        ``chunk_tape``/``chunk_slot`` carry the tail across an outer-sequence chunk
-        boundary: the last rank of pass g-1 publishes its tail, and rank 0 of pass g
-        consumes it instead of its own left neighbour. Both default to a no-op, so the
-        unchunked path is untouched.
-        """
+        """Exchange adjacent tails and snapshot the last rank's tail for the next pass."""
         if hidden.shape[0] < halo_rows:
             raise ValueError("CSA2 CP local rows must cover the attention halo")
         rank, size = cp_group.rank(), cp_group.size()
@@ -59,107 +40,56 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         ctx.input_shape = hidden.shape
         ctx.chunk_tape = chunk_tape
         ctx.chunk_slot = chunk_slot
-        boundary = hidden.new_zeros((halo_rows,) + hidden.shape[1:])
-        ops = []
-        if rank > 0:
-            ops.append(
-                dist.P2POp(dist.irecv, boundary, dist.get_global_rank(cp_group, rank - 1), cp_group)
+        ctx.chunk_index = chunk_tape.index if chunk_tape is not None else 0
+        ctx.consumed_previous_tail = False
+        tail = hidden[-halo_rows:].contiguous()
+        if size > 1:
+            gathered = tail.new_empty((size,) + tuple(tail.shape))
+            dist.all_gather_into_tensor(
+                gathered.view(size * tail.shape[0], *tail.shape[1:]), tail, group=cp_group
             )
-        if rank + 1 < size:
-            ops.append(
-                dist.P2POp(
-                    dist.isend,
-                    hidden[-halo_rows:].contiguous(),
-                    dist.get_global_rank(cp_group, rank + 1),
-                    cp_group,
-                )
-            )
-        for request in dist.batch_isend_irecv(ops):
-            request.wait()
+            boundary = tail.new_zeros(tail.shape)
+            if rank > 0:
+                boundary = gathered[rank - 1]
+        else:
+            gathered = tail.unsqueeze(0)
+            boundary = torch.zeros_like(tail)
         if chunk_tape is not None:
-            if rank == size - 1:
-                chunk_tape.ship_tail(chunk_slot, hidden[-halo_rows:])
-            if rank == 0:
-                prior = chunk_tape.tail_from_previous(chunk_slot)
-                if prior is not None:
-                    # Overwrite with the previous pass's tail but keep the exchange's
-                    # backward node alive: rank 1 still sends a gradient that has to land
-                    # somewhere, and `boundary * 0` preserves that path.
-                    boundary = prior.to(boundary.dtype) + boundary * 0
+            chunk_tape.ship_tail(chunk_slot, gathered[-1])
+            prior = chunk_tape.tail_from_previous(chunk_slot)
+            ctx.consumed_previous_tail = prior is not None
+            if rank == 0 and prior is not None:
+                boundary = prior.to(boundary.dtype) + boundary * 0
         return boundary
 
     @staticmethod
     def backward(ctx, grad_boundary: Tensor):
-        """Return halo gradients to the rank that owns the exchanged rows.
-
-        Rank ``r``'s tail gradient is consumed by rank ``r - 1``, so the direct
-        implementation is a directed point-to-point ring. That ring is the fragile
-        part of this path: each rank waits for exactly one neighbour, and the
-        neighbour may be parked inside a different communicator's host-side
-        synchronisation (the MoE dispatcher waits for its device-to-host expert
-        split copy before the variable-size all-to-all). At long-context CP the two
-        waits close a cycle -- the neighbour cannot issue the message this rank
-        needs until a collective this rank is already blocking completes -- and the
-        job stalls until the NCCL watchdog fires.
-
-        ``_HALO_XCHG`` selects the exchange. ``allgather`` (default) replaces the
-        ring with one group-wide collective: slot ``r`` holds rank ``r``'s boundary
-        gradient and rank ``r - 1`` copies slot ``r`` into its tail, so the values
-        are identical while every rank waits for the same collective and no rank can
-        be the unique blocker of another. ``p2p`` keeps the original ring for
-        comparison and for groups small enough that the ring is clearly cheaper.
-        Both are measured by the caller's training loop; see the worklog entry from
-        2026-10-25 for the step times that made ``allgather`` the default.
-        """
+        """Return halo and prior-pass gradients with one group collective."""
         group = ctx.cp_group
         rank, size = group.rank(), group.size()
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
         chunk_tape = getattr(ctx, "chunk_tape", None)
-        if chunk_tape is not None and rank == 0:
-            # Rank 0 consumed the previous pass's tail; hand that gradient back to the
-            # rank that produced it (the last rank of the previous pass).
-            chunk_tape.ship_tail_grad(ctx.chunk_slot, grad_boundary)
 
-        def _finish():
-            # The next pass's rank 0 consumed our tail, so its gradient belongs on our tail.
-            if chunk_tape is not None and rank == size - 1:
-                later = chunk_tape.tail_grad_from_next(ctx.chunk_slot)
-                if later is not None:
-                    grad_input[-ctx.halo_rows :] = grad_input[-ctx.halo_rows :] + later.to(
-                        grad_input.dtype
-                    )
-            return grad_input, None, None, None, None
-
-        if size == 1:
-            return _finish()
-        if _halo_xchg_mode() == "p2p":
-            ops = []
-            if rank > 0:
-                ops.append(
-                    dist.P2POp(
-                        dist.isend,
-                        grad_boundary.contiguous(),
-                        dist.get_global_rank(group, rank - 1),
-                        group,
-                    )
-                )
-            received = None
-            if rank + 1 < size:
-                received = grad_boundary.new_empty(grad_boundary.shape)
-                ops.append(
-                    dist.P2POp(dist.irecv, received, dist.get_global_rank(group, rank + 1), group)
-                )
-            for request in dist.batch_isend_irecv(ops):
-                request.wait()
-            if received is not None:
-                grad_input[-ctx.halo_rows :] = received
-            return _finish()
+        # Whether a previous tail exists changes values, never participation.
         halo = grad_boundary.contiguous()
-        gathered = halo.new_empty((size,) + tuple(halo.shape))
-        dist.all_gather_into_tensor(gathered, halo, group=group)
+        if rank == 0 and not ctx.consumed_previous_tail:
+            halo = torch.zeros_like(halo)
+        if size == 1:
+            gathered = halo.unsqueeze(0)
+        else:
+            gathered = halo.new_empty((size,) + tuple(halo.shape))
+            dist.all_gather_into_tensor(
+                gathered.view(size * halo.shape[0], *halo.shape[1:]), halo, group=group
+            )
         if rank + 1 < size:
             grad_input[-ctx.halo_rows :] = gathered[rank + 1]
-        return _finish()
+        if chunk_tape is not None and rank == size - 1:
+            if ctx.chunk_index > 0:
+                chunk_tape.ship_tail_grad(ctx.chunk_index, ctx.chunk_slot, gathered[0])
+            later = chunk_tape.tail_grad_from_next(ctx.chunk_index, ctx.chunk_slot)
+            if later is not None:
+                grad_input[-ctx.halo_rows :] += later.to(grad_input.dtype)
+        return grad_input, None, None, None, None
 
 
 class _HaloGrad(torch.autograd.Function):
@@ -236,9 +166,7 @@ def start_csa2_boundary_exchange(
     recv = hidden.new_zeros((halo_rows,) + hidden.shape[1:])
     ops = []
     if rank > 0:
-        ops.append(
-            dist.P2POp(dist.irecv, recv, dist.get_global_rank(cp_group, rank - 1), cp_group)
-        )
+        ops.append(dist.P2POp(dist.irecv, recv, dist.get_global_rank(cp_group, rank - 1), cp_group))
     if rank + 1 < size:
         ops.append(
             dist.P2POp(
@@ -260,10 +188,20 @@ def finish_csa2_boundary_exchange(handle: CSA2BoundaryExchange) -> Tensor:
 
 
 def exchange_csa2_boundary_hidden(
-    hidden: Tensor, halo_rows: int, cp_group: dist.ProcessGroup
+    hidden: Tensor,
+    halo_rows: int,
+    cp_group: dist.ProcessGroup,
+    chunk_tape=None,
+    chunk_slot: int = -1,
 ) -> Tensor:
-    """Fetch the previous contiguous rank's tail using neighbor-only traffic."""
-    return _LeftBoundaryExchange.apply(hidden, halo_rows, cp_group)
+    """Fetch adjacent-rank halos with one CP all-gather per forward and backward.
+
+    ``chunk_tape`` carries the last-rank tail across outer chunks. All CP ranks
+    enter each collective in the same order; pass index and prior-tail availability
+    change values after communication, never collective participation. With no tape,
+    no cross-pass state is stored. K=1 keeps the ordinary halo values and gradients.
+    """
+    return _LeftBoundaryExchange.apply(hidden, halo_rows, cp_group, chunk_tape, chunk_slot)
 
 
 @dataclass(frozen=True)
@@ -284,27 +222,22 @@ class CSA2CPCompressionLayout:
         """Select each group's unique owner, retaining the all-gather autograd edge."""
         if gathered.shape[0] != self.local.cp_size * self.local.capacity:
             raise ValueError("CSA2 gathered K must match the rank-major compression capacity")
-        import os as _os
-
-        if _os.environ.get("DSV41_TSM_DEBUG", "0") == "1":
-            # The next op is index_select, whose overrun only surfaces as an opaque device
-            # assert inside ATen's gather kernel; check it here while it is a Python fact.
-            _gi = self.gather_indices
-            _mx = int(_gi.max().item()) if _gi.numel() else -1
-            print(
-                f"[tsm] gathered={tuple(gathered.shape)} indices={tuple(_gi.shape)} "
-                f"idx_max={_mx} in_range={_mx < gathered.shape[0]} "
-                f"local_cp={self.local.cp_size} cap={self.local.capacity} "
-                f"chunk={getattr(self.local, 'chunk_index', -1)}/"
-                f"{getattr(self.local, 'chunk_count', -1)}",
-                flush=True,
+        # index_select requires every index in [0, rows). Invalid groups are already addressed
+        # as 0 by the layout builder, so an out-of-range index here never means "unowned" - it
+        # means the mapping for a VALID group is wrong, and silently clamping it would turn a
+        # layout bug into a wrong value. Fail fast instead, and only substitute a safe address
+        # for rows that are masked to zero afterwards anyway.
+        valid = self.global_layout.valid_groups
+        indices = self.gather_indices
+        bad = valid & ((indices < 0) | (indices >= gathered.shape[0]))
+        if bool(bad.any().item()):
+            _first = int(bad.nonzero().flatten()[0])
+            raise ValueError(
+                f"valid CSA2 group {_first} maps to gathered row {int(indices[_first])} "
+                f"outside [0, {gathered.shape[0]}) "
+                f"(capacity={self.local.capacity}, cp_size={self.local.cp_size})"
             )
-            if _mx >= gathered.shape[0]:
-                raise ValueError(
-                    f"CSA2 gather index {_mx} outside {gathered.shape[0]} rows "
-                    f"(capacity={self.local.capacity}, cp_size={self.local.cp_size})"
-                )
-        output = gathered.index_select(0, self.gather_indices)
+        output = gathered.index_select(0, indices.masked_fill(~valid, 0))
         invalid = ~self.global_layout.valid_groups.reshape(-1, *([1] * (gathered.ndim - 1)))
         return output.masked_fill(invalid, 0)
 
@@ -375,12 +308,18 @@ def build_csa2_cp_compression_layout(
     if global_layout.capacity == 0:
         gather_indices = rows[:0]
     else:
-        owner = global_layout.source_indices[:, -1] // tokens.total_tokens
-        rank_start = owner * tokens.total_tokens
+        # The source identifies a virtual owner (chunk_index * cp_size + cp_rank).
+        # Use that coordinate for the owner's first compressed group, but address the
+        # gathered tensor through its corresponding physical CP slot.
+        virtual_owner = global_layout.source_indices[:, -1] // tokens.total_tokens
+        owner = virtual_owner % tokens.cp_size
+        rank_start = virtual_owner * tokens.total_tokens
         first_seq = torch.bucketize(rank_start, cu[1:], right=True).clamp_max(starts.numel() - 1)
         first_group = (rank_start - ratio - starts[first_seq]).clamp_min(0).add(ratio - 1) // ratio
         first_global = global_layout.cu_seqlens_padded[first_seq] + first_group
         gather_indices = (
             owner * capacity + torch.arange(global_layout.capacity, device=cu.device) - first_global
-        ).masked_fill(~global_layout.valid_groups, 0)
+        ).masked_fill(
+            ~global_layout.valid_groups | (virtual_owner // tokens.cp_size != tokens.chunk_index), 0
+        )
     return CSA2CPCompressionLayout(local, global_layout, gather_indices)

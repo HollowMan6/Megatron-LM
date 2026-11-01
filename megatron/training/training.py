@@ -62,6 +62,10 @@ from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.memory_profile import phase as memory_profile_phase
+from megatron.core.memory_profile import step_abort as memory_profile_step_abort
+from megatron.core.memory_profile import step_end as memory_profile_step_end
+from megatron.core.memory_profile import step_start as memory_profile_step_start
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -2259,6 +2263,8 @@ def pretrain(
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
+    memory_profile_phase("optimizer_init_complete")
+
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
@@ -2959,6 +2965,7 @@ def setup_model_and_optimizer(
             register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
 
     model = _build_model_wrapper(wrap_with_ddp)
+    memory_profile_phase("model_build_complete")
     unwrapped_model = unwrap_model(model)
 
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
@@ -3293,6 +3300,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
+
+    memory_profile_step_start(
+        getattr(pg_collection, "cp", None) or get_context_parallel_group(check_initialized=False)
+    )
+
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
@@ -3531,6 +3543,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
+
+    memory_profile_step_end(
+        model,
+        optimizer,
+        step=iteration,
+        cp_group=(
+            getattr(pg_collection, "cp", None)
+            or get_context_parallel_group(check_initialized=False)
+        ),
+    )
 
     if is_last_stage and losses_reduced:
         # Average loss across microbatches.
@@ -5184,21 +5206,28 @@ def train(
             # OTel: optional per-step span wrapping the real train_step.
             with _first_iter_span_cm, _otel_managed_span('step', 'megatron.train.iteration', is_goodput_span=True, **{'megatron.iteration': iteration}) as _step_span:
                 ft_integration.on_training_step_start()
-                (
-                    loss_dict,
-                    skipped_iter,
-                    should_checkpoint,
-                    should_exit,
-                    exit_code,
-                    grad_norm,
-                    num_zeros_in_grad,
-                    max_attention_logit,
-                    samples_seen_in_iteration,
-                ) = train_step(
-                    forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
-                    pg_collection=pg_collection,
-                    p2p_communicator=p2p_communicator,
-                )
+                try:
+                    (
+                        loss_dict,
+                        skipped_iter,
+                        should_checkpoint,
+                        should_exit,
+                        exit_code,
+                        grad_norm,
+                        num_zeros_in_grad,
+                        max_attention_logit,
+                        samples_seen_in_iteration,
+                    ) = train_step(
+                        forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
+                        pg_collection=pg_collection,
+                        p2p_communicator=p2p_communicator,
+                    )
+                except Exception:
+                    memory_profile_step_abort(
+                        getattr(pg_collection, "cp", None)
+                        or get_context_parallel_group(check_initialized=False)
+                    )
+                    raise
                 ft_integration.on_training_step_end()
                 if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                     _maybe_raise_workload_exception()

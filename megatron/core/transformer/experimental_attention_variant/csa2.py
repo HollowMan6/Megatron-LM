@@ -20,6 +20,7 @@ from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.chunk_tape import extend_chunk_kv
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
@@ -35,6 +36,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+    CSA2BlockTopK,
     CSA2CandidateBlocks,
     candidate_blocks_from_block_scores,
     candidate_blocks_from_scores,
@@ -75,6 +77,9 @@ _SELECT_ROW_CHUNK_ELEMENTS = 1 << 24
 # 4096 keys per merge cuts merge calls 64x and the extra sort work to ~12%
 # (tie-breaking is unaffected: merged keys are still index-ascending).
 _SELECT_MERGE_STAGE_KEYS = 4096
+
+# Bounds the fp32 candidate slab to 4*s*C bytes (217 MiB at s=13900).
+_CANDIDATE_BLOCK_CHUNK_SIZE = 4096
 
 # Rows per row-chunk when a bool mask is expanded onto a [rows, groups] score
 # matrix, as a bool-element budget (1 byte per element, so 16 MiB per live
@@ -222,7 +227,8 @@ def _streaming_indexer_topk(
     candidates: CSA2CandidateBlocks | torch.Tensor | None,
     want_block_scores: bool,
     candidate_block_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor | None]:
+    candidate_topk_blocks: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor | CSA2BlockTopK | None]:
     """Fused no-grad THD select: stream key chunks, never build [b, s, keys].
 
     Bit-identical to ``forward_before_topk`` + ``select_indices`` in the
@@ -245,9 +251,10 @@ def _streaming_indexer_topk(
     scores: the block maxima are the statistic the candidate set is derived
     from, so they cannot depend on a candidate set.
 
-    Returns ``(indices [b, s, min(topk, keys)] int32 sorted ascending with -1
-    sentinels, block_scores [s, num_local_blocks] fp32 | None)``. The width stays
-    fixed even when fewer keys are live, matching ``select_indices``.
+    Returns key indices plus either a dense fp32 block table or CSA2BlockTopK.
+    K>1 with more than C local blocks folds completed C-block slabs immediately
+    into rolling candidates. K=1 and small tables retain the original dense fold.
+    Key selection width stays fixed even when fewer keys are live.
     """
     s, b = q.shape[0], q.shape[1]
     keys = indexer_k.shape[0]
@@ -258,9 +265,23 @@ def _streaming_indexer_topk(
         block_scores = None
         if want_block_scores:
             n_local_blocks = -(-compressed_layout.max_seqlen // candidate_block_size)
-            block_scores = torch.full(
-                (s, n_local_blocks), -torch.inf, device=q.device, dtype=torch.float32
-            )
+            if (
+                getattr(thd_layout, "chunk_count", 1) > 1
+                and n_local_blocks > _CANDIDATE_BLOCK_CHUNK_SIZE
+            ):
+                visible = ((thd_layout.position_ids + 1) // compress_ratio).unsqueeze(-1)
+                block_scores = CSA2BlockTopK(
+                    s,
+                    n_local_blocks,
+                    candidate_topk_blocks,
+                    candidate_block_size,
+                    visible,
+                    q.device,
+                )
+            else:
+                block_scores = torch.full(
+                    (s, n_local_blocks), -torch.inf, device=q.device, dtype=torch.float32
+                )
         return (torch.empty(b, s, k, dtype=torch.int32, device=q.device), block_scores)
     if b != 1:
         raise ValueError("the fused THD select requires the packed b=1 regime")
@@ -274,9 +295,20 @@ def _streaming_indexer_topk(
 
     # Candidate membership in the sequence-local block slot space, so each
     # chunk costs one gather instead of a full [s, keys] expansion.
-    n_local_blocks = (
-        -(-compressed_layout.max_seqlen // candidate_block_size) if candidate_block_size > 0 else 0
+    # Sized from the layout's key space, not from one sequence's max length: a chunked pass
+    # addresses keys from the start of the timeline to its own end (capacity spans
+    # global_start + total_tokens), so key_local // block_size reaches further than one
+    # sequence's blocks. Sizing it per sequence is what made member[...] index past the table
+    # and trip a device-side assert at K=2.
+    # Widen to the larger of the two spans. A chunked pass addresses keys from the start of
+    # the timeline up to its own end, so `total_tokens` alone is what keeps `member[...]`
+    # inside the table at K=2; a whole-sequence pass is bounded by `max_seqlen`, and some
+    # callers build a layout that only carries the latter. Taking the maximum satisfies both
+    # without the AttributeError that a bare `total_tokens` read raises on those layouts.
+    _key_span = max(
+        int(getattr(compressed_layout, "total_tokens", 0) or 0), int(compressed_layout.max_seqlen)
     )
+    n_local_blocks = -(-_key_span // candidate_block_size) if candidate_block_size > 0 else 0
     # The slot space below is addressed by the ROW sequence ids (candidate
     # membership and the block table read) as well as by the compressed keys'
     # (slot_of_key), so its width must cover the maximum over BOTH. Sizing it from
@@ -290,7 +322,27 @@ def _streaming_indexer_topk(
         n_slots = (
             max(int(rows_seq.max().item()), int(compressed_layout.sequence_ids.max().item()), 0) + 1
         )
-    if isinstance(candidates, CSA2CandidateBlocks):
+    # Preserve the original full-table graph for K=1 and tables no wider than C.
+    stream_blocks = (
+        getattr(thd_layout, "chunk_count", 1) > 1 and n_local_blocks > _CANDIDATE_BLOCK_CHUNK_SIZE
+    )
+    rolling_blocks = None
+    if stream_blocks and want_block_scores:
+        rolling_blocks = CSA2BlockTopK(
+            s,
+            n_local_blocks,
+            candidate_topk_blocks,
+            candidate_block_size,
+            ((rows_pos + 1) // compress_ratio).unsqueeze(-1),
+            q.device,
+        )
+    compact_member = stream_blocks and isinstance(candidates, CSA2CandidateBlocks)
+    if compact_member:
+        if candidate_block_size != candidates.block_size:
+            raise ValueError("candidate block size mismatch with the candidate set")
+        member = None
+        member_of_chunk = None
+    elif isinstance(candidates, CSA2CandidateBlocks):
         if candidate_block_size != candidates.block_size:
             raise ValueError("candidate block size mismatch with the candidate set")
         member = torch.zeros((s, n_slots * n_local_blocks), dtype=torch.bool, device=q.device)
@@ -310,20 +362,9 @@ def _streaming_indexer_topk(
 
     block_table = None
     slot_of_key = None
-    if want_block_scores or member is not None:
-        if want_block_scores:
-            # [rows, n_slots * n_local_blocks] fp32, i.e. [rows, n_blocks] for a
-            # single-sequence pack (n_slots == 1). The width is the
-            # candidate-source layer's contract, not an accident of this fold:
-            # the dense path's _chunked_candidate_block_scores returns the same
-            # [rows, n_blocks] table and candidate_blocks_from_block_scores ranks
-            # it, so a fold that matches the dense reference can only ever hold
-            # that many values. At 16384 rows x 524288 keys that is 4 GiB with
-            # candidate_block_size=8 (65536 blocks/row) and 32 GiB with
-            # candidate_block_size=1 (524288 blocks/row); candidate_block_size is
-            # the config lever that trades block granularity for this table's
-            # size. Only the candidate-source layer allocates it: a consumer layer
-            # (member is not None) folds nothing.
+    if want_block_scores or member is not None or compact_member:
+        if want_block_scores and not stream_blocks:
+            # Explicit legacy fallback: K=1 or at most C local blocks.
             block_table = torch.full(
                 (s, n_slots * n_local_blocks), -torch.inf, device=q.device, dtype=torch.float32
             )
@@ -341,6 +382,25 @@ def _streaming_indexer_topk(
             compressed_layout.sequence_ids.clamp_min(0) * n_local_blocks
             + key_local // candidate_block_size
         )
+
+    block_bucket = None
+    local_block_table = None
+    row_ids = torch.arange(s, device=q.device)
+
+    def finish_block_bucket():
+        if local_block_table is None:
+            return
+        # A flattened bucket can straddle sequence slots. Rank only each row's
+        # own sequence, translating back to the original local block IDs.
+        lo = block_bucket * _CANDIDATE_BLOCK_CHUNK_SIZE
+        hi = lo + local_block_table.shape[-1]
+        for seq in range(lo // n_local_blocks, (hi - 1) // n_local_blocks + 1):
+            begin, end = max(lo, seq * n_local_blocks), min(hi, (seq + 1) * n_local_blocks)
+            rolling_blocks.update(
+                local_block_table[:, begin - lo : end - lo],
+                begin - seq * n_local_blocks,
+                rows_seq.clamp_min(0) == seq,
+            )
 
     run_idx = None
     run_score = None
@@ -366,8 +426,15 @@ def _streaming_indexer_topk(
     #     still own the causal maximum of its blocks, so it must stay staged
     #     for the fold and only lose the top-k merge.
     stage_bounds = None
-    if member is not None and slot_of_key is not None:
-        any_member = member.any(dim=0)  # [n_slots * n_local_blocks]
+    if (member is not None or compact_member) and slot_of_key is not None:
+        if compact_member:
+            # Only a 1-D liveness vector; no row-by-block membership table.
+            any_member = torch.zeros(n_slots * n_local_blocks, dtype=torch.bool, device=q.device)
+            ids = candidates.indices
+            flat_ids = rows_seq.clamp_min(0)[:, None] * n_local_blocks + ids.long()
+            any_member[flat_ids[ids >= 0]] = True
+        else:
+            any_member = member.any(dim=0)  # [n_slots * n_local_blocks]
         live_keys = any_member[slot_of_key]  # [keys]
         n_tiles = -(-keys // dense_key_chunk)
         pad = n_tiles * dense_key_chunk - keys
@@ -427,10 +494,18 @@ def _streaming_indexer_topk(
                 if _o3.environ.get("SH3", "0") == "1" and (
                     indexer_k[start:end].shape[0] == 0 or q.shape[2] == 0
                 ):
-                    print("[sh3] ik_slice=%s q=%s hw=%s start=%s end=%s ik_len=%s"
-                          % (tuple(indexer_k[start:end].shape), tuple(q.shape),
-                             tuple(head_weights.shape), start, end, indexer_k.shape[0]),
-                          flush=True)
+                    print(
+                        "[sh3] ik_slice=%s q=%s hw=%s start=%s end=%s ik_len=%s"
+                        % (
+                            tuple(indexer_k[start:end].shape),
+                            tuple(q.shape),
+                            tuple(head_weights.shape),
+                            start,
+                            end,
+                            indexer_k.shape[0],
+                        ),
+                        flush=True,
+                    )
                 c = torch.einsum("sbhd,tbd->bsht", q, indexer_k[start:end]).relu()
                 chunk[..., start - stage_start : end - stage_start] = (c * head_weights).sum(dim=2)
             keep_causal = (
@@ -442,7 +517,25 @@ def _streaming_indexer_topk(
                     <= rows_pos[:, None] + 1
                 )
             )
-            if member is not None:
+            if compact_member:
+                member_of_chunk = torch.zeros((s, width), dtype=torch.bool, device=q.device)
+                stage_slots = slot_of_key[stage_start:stage_end]
+                for bucket in torch.unique(stage_slots // _CANDIDATE_BLOCK_CHUNK_SIZE).tolist():
+                    lo = bucket * _CANDIDATE_BLOCK_CHUNK_SIZE
+                    bucket_width = min(_CANDIDATE_BLOCK_CHUNK_SIZE, n_slots * n_local_blocks - lo)
+                    flags = torch.zeros((s, bucket_width), dtype=torch.bool, device=q.device)
+                    ids = candidates.indices
+                    flat_ids = rows_seq.clamp_min(0)[:, None] * n_local_blocks + ids.long()
+                    valid = (ids >= 0) & (flat_ids >= lo) & (flat_ids < lo + bucket_width)
+                    flags[row_ids[:, None].expand_as(ids)[valid], flat_ids[valid] - lo] = True
+                    columns = (
+                        ((stage_slots >= lo) & (stage_slots < lo + bucket_width))
+                        .nonzero()
+                        .flatten()
+                    )
+                    member_of_chunk[:, columns] = flags[:, stage_slots[columns] - lo]
+                    del flags
+            elif member is not None:
                 if slot_of_key is not None:
                     member_of_chunk = member[:, slot_of_key[stage_start:stage_end]]
                 else:
@@ -474,6 +567,38 @@ def _streaming_indexer_topk(
                     reduce="amax",
                     include_self=True,
                 )
+            if rolling_blocks is not None:
+                # Valid packed keys advance monotonically in flattened slots;
+                # orphan padding may reset to zero and is excluded here.
+                stage_slots = slot_of_key[stage_start:stage_end]
+                valid_keys = compressed_layout.valid_groups[stage_start:stage_end]
+                for bucket in torch.unique(
+                    stage_slots[valid_keys] // _CANDIDATE_BLOCK_CHUNK_SIZE
+                ).tolist():
+                    if block_bucket != bucket:
+                        finish_block_bucket()
+                        del local_block_table
+                        block_bucket = bucket
+                        lo = bucket * _CANDIDATE_BLOCK_CHUNK_SIZE
+                        local_block_table = torch.full(
+                            (s, min(_CANDIDATE_BLOCK_CHUNK_SIZE, n_slots * n_local_blocks - lo)),
+                            -torch.inf,
+                            device=q.device,
+                            dtype=torch.float32,
+                        )
+                    lo = bucket * _CANDIDATE_BLOCK_CHUNK_SIZE
+                    columns = (
+                        (valid_keys & (stage_slots // _CANDIDATE_BLOCK_CHUNK_SIZE == bucket))
+                        .nonzero()
+                        .flatten()
+                    )
+                    local_block_table.scatter_reduce_(
+                        1,
+                        (stage_slots[columns] - lo)[None, :].expand(s, columns.numel()),
+                        chunk_causal[0, :, columns],
+                        reduce="amax",
+                        include_self=True,
+                    )
             chunk = chunk_causal
             if member_of_chunk is not None:
                 # Candidate membership only filters the top-k merge; the fold
@@ -511,7 +636,8 @@ def _streaming_indexer_topk(
             run_idx = F.pad(run_idx, (0, pad), value=-1)
             run_score = F.pad(run_score, (0, pad), value=-torch.inf)
         indices = run_idx.masked_fill(~run_score.isfinite(), -1).int()
-    block_scores = None
+    finish_block_bucket()
+    block_scores = rolling_blocks
     if block_table is not None:
         n_slots = block_table.shape[1] // n_local_blocks
         own = block_table.view(s, n_slots, n_local_blocks)[
@@ -520,57 +646,6 @@ def _streaming_indexer_topk(
         block_scores = own
     return indices, block_scores
 
-
-
-def extend_chunk_kv(tape, layer_idx, name, current):
-    """Append this pass's compressed KV to the cumulative buffer for a source slot.
-
-    Prefill passes grow the buffer. Gradient passes read it back as a leaf - the same
-    object every replay, so every later pass's contribution lands on one tensor - and
-    inject that adjoint into the current contribution before the CP gather, whose
-    reduce-scatter then delivers the total to the owning projection exactly once.
-    """
-    prior_key = (name, layer_idx, tape.index - 1)
-    this_key = (name, layer_idx, tape.index)
-    prior = tape.values.get(prior_key)
-    import os as _ok
-
-    if _ok.environ.get("KV_DEBUG", "0") == "1":
-        print("[kv] name=%s layer=%s mode=%s prior=%s current=%s idx=%s"
-              % (name, layer_idx, tape.mode,
-                 "None" if prior is None else tuple(prior.shape),
-                 tuple(current.shape), tape.index), flush=True)
-    if tape.mode == "prefill":
-        grown = current if prior is None else torch.cat([prior, current], dim=0)
-        tape.values[this_key] = grown.detach().clone()
-        return grown
-    out = current if prior is None else tape.make_leaf(prior_key, prior)
-    # The adjoint belongs to what THIS pass published (its cumulative output), not to the
-    # prefix: keying it on the prefix leaves the first pass with no injection at all.
-    if tape.has_adjoint(this_key):
-        out = _InjectChunkAdjoint.apply(out, tape, this_key)
-    tape.values[this_key] = out.detach().clone()
-    return out
-
-
-class _InjectChunkAdjoint(torch.autograd.Function):
-    """Fold a carried chunk adjoint into the gradient of the current contribution.
-
-    Sits upstream of the CP gather, so the gather's reduce-scatter delivers
-    (own loss + every later pass's contribution) to the owning projection once.
-    All-reducing the adjoint separately and injecting afterwards would double count.
-    """
-
-    @staticmethod
-    def forward(ctx, tensor, tape, key):
-        ctx.tape = tape
-        ctx.key = key
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad):
-        extra = ctx.tape.adjoint(ctx.key)
-        return grad + extra.to(grad.dtype), None, None
 
 @dataclass
 class CSA2State:
@@ -659,6 +734,10 @@ def _apply_thd_rope(
     if not x.shape[0] or not layout.max_seqlen:
         return x
     length = layout.max_seqlen * layout.ratio if compressed else layout.max_seqlen
+    # Positions are relative to each original packed sequence, including later chunks
+    # and CP halos; padding/unused groups index row zero. The layout validates each
+    # physical sequence against max_seqlen, and complete compressed groups start below
+    # floor(max_seqlen / ratio) * ratio. Packed token capacity is not a RoPE length.
     pos_dim = config.qk_pos_emb_head_dim
     if config.apply_rope_fusion:
         cos, sin = rotary_pos_emb.get_cached_cos_sin(
@@ -1046,7 +1125,8 @@ class CSA2Indexer(MegatronModule):
             winners = block.argsort(dim=-1, descending=True, stable=True)[..., :topk]
             parts.append(winners.sort(dim=-1).values)
         indices = torch.cat(parts, dim=0).reshape(*scores.shape[:-1], topk)
-        return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
+        out = indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
+        return out
 
     @torch.no_grad()
     def forward(
@@ -1087,7 +1167,8 @@ class CSA2Indexer(MegatronModule):
         candidates: CSA2CandidateBlocks | torch.Tensor | None = None,
         want_block_scores: bool = False,
         candidate_block_size: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        candidate_topk_blocks: int = 1,
+    ) -> Tuple[torch.Tensor, torch.Tensor | CSA2BlockTopK | None]:
         """Stream the THD no-grad select without building [b, s, keys].
 
         Produces exactly ``select_indices(forward_before_topk(...))`` for the
@@ -1107,6 +1188,7 @@ class CSA2Indexer(MegatronModule):
             candidates,
             want_block_scores,
             candidate_block_size,
+            candidate_topk_blocks,
         )
 
     def backward_dw(self) -> None:
@@ -1250,6 +1332,7 @@ class CompressedSparseAttention2(MegatronModule):
                 if __import__("os").environ.get("DSV41_CP_TRACE", "0") == "1":
                     import torch as _t
                     import torch.distributed as _d
+
                     _mode = "grad" if _t.is_grad_enabled() else "nograd"
                     print(
                         f"[cptrace] rank={_d.get_rank()} layer={getattr(self, 'layer_idx', -1)} "
@@ -1259,15 +1342,17 @@ class CompressedSparseAttention2(MegatronModule):
                 _gt = __import__("os").environ.get("DSV41_GATHER_TIMING", "0") == "1"
                 if _gt:
                     import time as _time
+
                     import torch as _torch
+
                     _n_k = state.indexer_k.numel() * state.indexer_k.element_size()
                     _n_v = state.global_kv.numel() * state.global_kv.element_size()
                     _c = self.cp_group.size()
                     _torch.cuda.synchronize()
                     _t0 = _time.perf_counter()
-                state.indexer_k = cp_layout.to_sequence_major(
-                    gather_from_sequence_parallel_region(state.indexer_k, group=self.cp_group)
-                )
+                _ik_g = gather_from_sequence_parallel_region(state.indexer_k, group=self.cp_group)
+                _ik_m = cp_layout.to_sequence_major(_ik_g)
+                state.indexer_k = _ik_m
                 if _gt:
                     _torch.cuda.synchronize()
                     _t1 = _time.perf_counter()
@@ -1281,35 +1366,17 @@ class CompressedSparseAttention2(MegatronModule):
                 # passes read it as a leaf and inject the adjoint the later passes
                 # accumulated, so the owning projection is credited exactly once.
                 _tape = getattr(state, "chunk_tape", None)
-                import os as _ost2
 
-                if _ost2.environ.get("TAPE_DEBUG", "0") == "1":
-                    print("[tape2] tape_ok=", _tape is not None, flush=True)
                 # 只有 KV source 层发布 source slot；Reindex/Reuse 消费者跳过，
                 # 否则会把 Full 层留下的扩展值再扩展一次（122880→245760→491520）。
                 if _tape is not None and self.is_kv_source:
+                    pass_begin = thd_layout.chunk_index * thd_layout.global_total_tokens
+                    prefix_mask = cp_layout.global_layout.source_indices[:, -1] < pass_begin
                     state.indexer_k = extend_chunk_kv(
-                        _tape, self.layer_idx, "indexer_k", state.indexer_k
+                        _tape, self.layer_idx, "indexer_k", state.indexer_k, prefix_mask
                     )
-                    # Name the coordinate-space mismatch while it is still a Python-level
-                    # fact: a gather with an out-of-range index only surfaces as an opaque
-                    # device-side assert inside ATen's gather kernel.
-                    import os as _os
-
-                    if _os.environ.get("DSV41_CHUNK_IDX_DEBUG", "0") == "1":
-                        _gi = getattr(state, "global_indices", None)
-                        _kv = state.global_kv
-                        _mx = int(_gi.max().item()) if _gi is not None and _gi.numel() else -1
-                        _mn = int(_gi.min().item()) if _gi is not None and _gi.numel() else -1
-                        print(
-                            f"[chunkidx] layer={self.layer_idx} pass={_tape.index} "
-                            f"kv_len={int(_kv.shape[0])} idx_min={_mn} idx_max={_mx} "
-                            f"gs={getattr(state.thd_layout, 'global_start', -1)} "
-                            f"ok={_mx < int(_kv.shape[0])}",
-                            flush=True,
-                        )
                     state.global_kv = extend_chunk_kv(
-                        _tape, self.layer_idx, "global_kv", state.global_kv
+                        _tape, self.layer_idx, "global_kv", state.global_kv, prefix_mask
                     )
                 if _gt:
                     _torch.cuda.synchronize()
@@ -1361,6 +1428,7 @@ class CompressedSparseAttention2(MegatronModule):
                     candidates=candidates,
                     want_block_scores=self.is_candidate_source,
                     candidate_block_size=self.config.csa2_candidate_block_size,
+                    candidate_topk_blocks=self.config.csa2_candidate_topk_blocks,
                 )
             if _FUSED_CHECK and fused is not None:
                 # Cross-check against the select a non-fused run would take: the
@@ -1422,6 +1490,39 @@ class CompressedSparseAttention2(MegatronModule):
                             state.compressed_layout,
                             self.config.csa2_candidate_block_size,
                         )
+                        if isinstance(_f_block, CSA2BlockTopK):
+                            _visible = ((thd_layout.position_ids + 1) // self.compress_ratio)[
+                                :, None
+                            ]
+                            _dense_ids = candidate_blocks_from_block_scores(
+                                _dense_block,
+                                _visible,
+                                self.config.csa2_candidate_topk_blocks,
+                                self.config.csa2_candidate_block_size,
+                            ).indices
+                            _f_ids = candidate_blocks_from_block_scores(
+                                _f_block,
+                                _visible,
+                                self.config.csa2_candidate_topk_blocks,
+                                self.config.csa2_candidate_block_size,
+                            ).indices
+                            if not torch.equal(_dense_ids, _f_ids):
+                                raise RuntimeError("CSA2_FUSED_CHECK: rolling candidate IDs differ")
+                            _newest = (_visible - 1) // self.config.csa2_candidate_block_size
+                            _dense_block = (
+                                _dense_block.masked_fill(
+                                    torch.arange(_dense_block.shape[-1], device=x.device)
+                                    == _newest,
+                                    torch.inf,
+                                )
+                                .gather(-1, _dense_ids.clamp_min(0).long())
+                                .masked_fill(_dense_ids < 0, -torch.inf)
+                            )
+                            _sentinel = torch.iinfo(torch.int64).max
+                            _order = _f_block.indices.masked_fill(
+                                ~(_f_block.values > -torch.inf), _sentinel
+                            ).argsort(dim=-1, stable=True)
+                            _f_block = _f_block.values.gather(-1, _order)
                         _same_shape = _f_block.shape == _dense_block.shape
                         if not _same_shape or not bool(torch.equal(_f_block, _dense_block)):
                             if _same_shape:
@@ -1489,7 +1590,11 @@ class CompressedSparseAttention2(MegatronModule):
                         _indices, block_scores = fused
                         visible = (thd_layout.position_ids + 1) // self.compress_ratio
                         state.candidates = candidate_blocks_from_block_scores(
-                            block_scores.unsqueeze(0),
+                            (
+                                block_scores
+                                if isinstance(block_scores, CSA2BlockTopK)
+                                else block_scores.unsqueeze(0)
+                            ),
                             visible.unsqueeze(0).unsqueeze(-1),
                             self.config.csa2_candidate_topk_blocks,
                             self.config.csa2_candidate_block_size,
@@ -1614,11 +1719,7 @@ class CompressedSparseAttention2(MegatronModule):
             csa2_state = CSA2State()
             if thd_layout is not None:
                 csa2_state.chunk_tape = getattr(thd_layout, "chunk_tape", None)
-        import os as _ost
 
-        if _ost.environ.get("TAPE_DEBUG", "0") == "1":
-            print(f"[tape1] layout_has_tape={getattr(thd_layout, 'chunk_tape', None) is not None} "
-                  f"state_has_tape={csa2_state.chunk_tape is not None}", flush=True)
         if thd_layout is not None:
             if csa2_state.thd_layout is None:
                 csa2_state.thd_layout = thd_layout
