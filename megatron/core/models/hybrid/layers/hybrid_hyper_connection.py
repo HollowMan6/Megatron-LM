@@ -9,13 +9,13 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import HyperConnectionModule, SinglePassMHCState
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
 )
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import CrossLayerState, TransformerLayer
 
 
 class HyperConnectionHybridLayer(MegatronModule):
@@ -58,6 +58,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata],
         padding_mask: Optional[Tensor],
+        cross_layer_state: CrossLayerState | None = None,
         input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         if isinstance(self.inner_layer, TransformerLayer):
@@ -69,6 +70,11 @@ class HyperConnectionHybridLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
+                **(
+                    {"cross_layer_state": cross_layer_state}
+                    if cross_layer_state is not None
+                    else {}
+                ),
                 input_ids=input_ids,
             )
         else:
@@ -98,6 +104,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         sequence_len_offset: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
+        cross_layer_state: CrossLayerState | None = None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
@@ -131,6 +138,11 @@ class HyperConnectionHybridLayer(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                     mhc_recompute_manager=mhc_recompute_manager,
+                    **(
+                        {"cross_layer_state": cross_layer_state}
+                        if cross_layer_state is not None
+                        else {}
+                    ),
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -138,6 +150,11 @@ class HyperConnectionHybridLayer(MegatronModule):
             )
             return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
+        mlp_kwargs = (
+            cross_layer_state.mlp_kwargs(layer.layer_number)
+            if cross_layer_state is not None and hasattr(cross_layer_state, "mlp_kwargs")
+            else {}
+        )
         output_with_bias, residual = layer._forward_mlp_output_with_bias(
             hidden_states,
             inference_context=inference_context,
@@ -145,6 +162,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             packed_seq_params=packed_seq_params,
             input_ids=input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
+            **({"mlp_kwargs": mlp_kwargs} if mlp_kwargs else {}),
         )
         if layer.recompute_pre_mlp_layernorm or (
             mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
@@ -168,11 +186,16 @@ class HyperConnectionHybridLayer(MegatronModule):
         padding_mask: Optional[Tensor] = None,
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
         mhc_recompute_manager=None,
+        mhc_state: SinglePassMHCState | None = None,
+        cross_layer_state: CrossLayerState | None = None,
         input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
         aggregated, h_res, h_post, residual = self.hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
+            hidden_states,
+            mhc_recompute_manager=mhc_recompute_manager,
+            return_residual=True,
+            **({"mhc_state": mhc_state} if mhc_state is not None else {}),
         )
         fast_path_result = self._call_inner_transformer_layer_without_local_bda(
             aggregated,
@@ -182,8 +205,9 @@ class HyperConnectionHybridLayer(MegatronModule):
             sequence_len_offset,
             packed_seq_params,
             padding_mask,
-            input_ids,
-            mhc_recompute_manager,
+            cross_layer_state=cross_layer_state,
+            input_ids=input_ids,
+            mhc_recompute_manager=mhc_recompute_manager,
         )
 
         if fast_path_result is None:
@@ -196,7 +220,8 @@ class HyperConnectionHybridLayer(MegatronModule):
                 packed_seq_params,
                 packed_sequence_cp_metadata,
                 padding_mask,
-                input_ids,
+                cross_layer_state=cross_layer_state,
+                input_ids=input_ids,
             )
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
                 aggregated = aggregated.to(layer_output.dtype)

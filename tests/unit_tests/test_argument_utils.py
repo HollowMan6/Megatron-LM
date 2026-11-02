@@ -1250,6 +1250,7 @@ class TestMegatronMLAArgumentGeneration:
             ("dsv4_hybrid", "H", [128]),
             (None, "W", [0]),
             ("dsa", "W", None),
+            ("dsa", "V", None),
             ("dsa", "M-/C-", None),
         ],
     )
@@ -1281,7 +1282,7 @@ class TestMegatronMLAArgumentGeneration:
             args = validate_args(parse_args())
 
         if variant not in (None, 'dsv4_hybrid'):
-            with pytest.raises(ValueError, match="C/H/W attention requires.*dsv4_hybrid"):
+            with pytest.raises(ValueError, match="C/H/V/W attention requires.*dsv4_hybrid"):
                 core_transformer_config_from_args(args)
             return
 
