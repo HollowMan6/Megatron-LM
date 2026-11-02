@@ -205,9 +205,9 @@ class HyperConnectionHybridLayer(MegatronModule):
             sequence_len_offset,
             packed_seq_params,
             padding_mask,
-            cross_layer_state=cross_layer_state,
             input_ids=input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
+            **({"cross_layer_state": cross_layer_state} if cross_layer_state is not None else {}),
         )
 
         if fast_path_result is None:
@@ -220,8 +220,12 @@ class HyperConnectionHybridLayer(MegatronModule):
                 packed_seq_params,
                 packed_sequence_cp_metadata,
                 padding_mask,
-                cross_layer_state=cross_layer_state,
                 input_ids=input_ids,
+                **(
+                    {"cross_layer_state": cross_layer_state}
+                    if cross_layer_state is not None
+                    else {}
+                ),
             )
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
                 aggregated = aggregated.to(layer_output.dtype)

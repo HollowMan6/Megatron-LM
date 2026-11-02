@@ -782,7 +782,11 @@ class HybridStack(MegatronModule):
                     )
                     if layer_at_or_after_boundary and not gradient_boundary_applied:
                         hidden_states = hidden_states.detach()
-                        forward_context.detach_for_backward()
+                        if layer_idx > 0:
+                            # Cut only state that this stage's frozen layers produced. Before
+                            # the first layer the context holds the caller's inputs, which can
+                            # be trainable (DSpark's projected target features).
+                            forward_context.detach_for_backward()
                         gradient_boundary_applied = True
                     # Frozen-prefix layers run under no_grad, so they need no recomputation.
                     residual_stream_recompute_context = (

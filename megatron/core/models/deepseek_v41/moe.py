@@ -126,10 +126,28 @@ def multimodal_moe_forward(moe, hidden_states, image_mask, padding_mask=None):
 class ModalityMoELayer(MoELayer):
     """The normal MoE layer with an explicit per-forward modality input."""
 
-    def forward(self, hidden_states, intermediate_tensors=None, padding_mask=None, image_mask=None):
-        """Dispatch using modality-specific biases without retaining the mask on a module."""
+    def forward(
+        self,
+        hidden_states,
+        intermediate_tensors=None,
+        padding_mask=None,
+        image_mask=None,
+        input_ids=None,
+        packed_seq_params=None,
+    ):
+        """Dispatch using modality-specific biases without retaining the mask on a module.
+
+        ``input_ids`` and ``packed_seq_params`` follow the base MoE interface. The text-only
+        path passes them through; the modality router uses neither.
+        """
         if image_mask is None:
-            return super().forward(hidden_states, intermediate_tensors, padding_mask)
+            return super().forward(
+                hidden_states,
+                intermediate_tensors,
+                padding_mask,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
+            )
         if intermediate_tensors is not None:
             raise NotImplementedError("Modality routing requires an unsplit MoE forward")
         return multimodal_moe_forward(self, hidden_states, image_mask, padding_mask)
