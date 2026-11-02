@@ -33,6 +33,7 @@ from megatron.core.transformer.hyper_connection import (
 )
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.stateful_module import detach_state
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -285,6 +286,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         name: str | None = None,
     ):
         super().__init__(config=config)
+
+        if (
+            config.experimental_attention_variant == "dsv4_hybrid"
+            and config.dsv4_version == "v4.1"
+            and config.recompute_granularity == "full"
+        ):
+            raise NotImplementedError(
+                "CSA2 full recompute requires the stateful HybridStack execution path"
+            )
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -749,6 +759,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     )
                     if layer_at_or_after_boundary and not gradient_boundary_applied:
                         hidden_states = hidden_states.detach()
+                        shared_state_kwargs = {
+                            key: detach_state(value) for key, value in shared_state_kwargs.items()
+                        }
+                        if "mhc_state" in shared_state_kwargs:
+                            mhc_state = shared_state_kwargs["mhc_state"]
                         gradient_boundary_applied = True
                     residual_accumulator = hidden_states
                     # Get appropriate inner quantization context

@@ -730,9 +730,19 @@ class HybridStack(MegatronModule):
             if use_residual_stream_recompute
             else [None] * self.num_layers_per_pipeline_rank
         )
+        use_stateful_full_recompute = (
+            self.training
+            and self.config.recompute_granularity == 'full'
+            and self.forward_adapter is not None
+            and hasattr(self.forward_adapter, 'checkpoint_layer')
+        )
 
         with outer_fp8_context:
-            if self.config.recompute_granularity == 'full' and self.training:
+            if (
+                self.config.recompute_granularity == 'full'
+                and self.training
+                and not use_stateful_full_recompute
+            ):
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -772,6 +782,7 @@ class HybridStack(MegatronModule):
                     )
                     if layer_at_or_after_boundary and not gradient_boundary_applied:
                         hidden_states = hidden_states.detach()
+                        forward_context.detach_for_backward()
                         gradient_boundary_applied = True
                     # Frozen-prefix layers run under no_grad, so they need no recomputation.
                     residual_stream_recompute_context = (
@@ -877,7 +888,12 @@ class HybridStack(MegatronModule):
                                     )
                                 if forward_context.mhc_state is not None:
                                     layer_kwargs["mhc_state"] = forward_context.mhc_state
-                                hidden_states, _ = layer(**layer_kwargs)
+                                if use_stateful_full_recompute and layer_at_or_after_boundary:
+                                    hidden_states, _ = self.forward_adapter.checkpoint_layer(
+                                        layer, layer_kwargs, forward_context
+                                    )
+                                else:
+                                    hidden_states, _ = layer(**layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(
                                     hidden_states=hidden_states,
@@ -924,6 +940,7 @@ class HybridStack(MegatronModule):
                 if not gradient_boundary_applied:
                     # Every layer here lies before the boundary; see TransformerBlock.forward.
                     hidden_states = hidden_states.detach()
+                    forward_context.detach_for_backward()
 
         if self.residual_stream_readout is not None:
             hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
