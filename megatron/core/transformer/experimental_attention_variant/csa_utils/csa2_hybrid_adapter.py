@@ -15,7 +15,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_can
     CSA2CandidateBlocks,
 )
 from megatron.core.transformer.hyper_connection import SinglePassMHCState
-from megatron.core.transformer.stateful_module import _checkpoint_contexts
+from megatron.core.transformer.stateful_module import _checkpoint_contexts, _checkpoint_replay_scope
 
 
 class _PinnedResidual:
@@ -27,21 +27,45 @@ class _PinnedResidual:
     activation footprint (40 KB/token with four residual streams), and the term
     that decides whether a 512K context fits. The tensor is read exactly once, by
     the replay, so it can wait in host memory instead of on the device.
+
+    The device-to-host copy runs on a side stream, so the forward does not wait for
+    it; the replay waits for that copy before reading the host buffer back.
     """
 
-    __slots__ = ("cpu", "dtype", "shape", "device")
+    __slots__ = ("cpu", "dtype", "shape", "device", "copied")
 
     def __init__(self, tensor: torch.Tensor):
         self.cpu = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
-        self.cpu.copy_(tensor, non_blocking=False)
         self.dtype = tensor.dtype
         self.shape = tensor.shape
         self.device = tensor.device
+        stream = _offload_stream(tensor.device)
+        stream.wait_stream(torch.cuda.current_stream(tensor.device))
+        with torch.cuda.stream(stream):
+            self.cpu.copy_(tensor, non_blocking=True)
+            self.copied = torch.cuda.Event()
+            self.copied.record(stream)
+        # The caller may free the device tensor next; keep its block until the copy reads it.
+        tensor.record_stream(stream)
 
     def restore(self) -> torch.Tensor:
+        """Copy the residual back to its device after the offload copy has finished."""
+        torch.cuda.current_stream(self.device).wait_event(self.copied)
         out = torch.empty(self.shape, dtype=self.dtype, device=self.device)
         out.copy_(self.cpu, non_blocking=True)
         return out
+
+
+_OFFLOAD_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
+
+
+def _offload_stream(device: torch.device) -> torch.cuda.Stream:
+    """One side stream per device for residual offload copies."""
+    stream = _OFFLOAD_STREAMS.get(device)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _OFFLOAD_STREAMS[device] = stream
+    return stream
 
 
 def _residual_offload_hooks(residual: torch.Tensor):
@@ -54,7 +78,11 @@ def _residual_offload_hooks(residual: torch.Tensor):
     target = residual.data_ptr()
 
     def pack(tensor):
-        if not isinstance(tensor, torch.Tensor) or tensor.data_ptr() != target:
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or not tensor.is_cuda
+            or tensor.data_ptr() != target
+        ):
             return tensor
         return _PinnedResidual(tensor)
 
@@ -181,7 +209,7 @@ class CSA2HybridAdapter:
         residual = layer_kwargs["hidden_states"]
         offload = _residual_offload_enabled()
         hooks = _residual_offload_hooks(residual) if offload else contextlib.nullcontext()
-        with hooks:
+        with hooks, _checkpoint_replay_scope():
             result = checkpoint(
                 run,
                 residual,

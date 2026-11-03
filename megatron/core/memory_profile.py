@@ -27,6 +27,8 @@ _PHASE_INDEX = 0
 # million entries leaves headroom without the unbounded growth of ``None``.
 _HISTORY_MAX_ENTRIES = 1_000_000
 _HISTORY_ACTIVE = False
+# The recorder covers one training step per process; later steps leave it off.
+_HISTORY_DONE = False
 _HISTORY_START_BLOCKS: list[dict[str, Any]] | None = None
 _HISTORY_START_ERROR: str | None = None
 
@@ -87,9 +89,10 @@ def _capture_history_start_blocks() -> list[dict[str, Any]]:
 
 def _finish_history(path: Path) -> None:
     """Write and disable the active recorder while preserving the original error."""
-    global _HISTORY_ACTIVE, _HISTORY_START_BLOCKS, _HISTORY_START_ERROR
+    global _HISTORY_ACTIVE, _HISTORY_DONE, _HISTORY_START_BLOCKS, _HISTORY_START_ERROR
     if not _HISTORY_ACTIVE:
         return
+    _HISTORY_DONE = True
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.cuda.memory._dump_snapshot(str(path))
@@ -115,12 +118,14 @@ def _finish_history(path: Path) -> None:
 
 
 def step_start(cp_group: Any | None = None) -> None:
-    """Start allocator history recording for the next training step."""
-    path = _history_path()
-    rank_zero = _rank_zero(cp_group) if cp_group is not None else _rank_zero()
-    if path is None or not rank_zero or not torch.cuda.is_available():
-        return
+    """Start allocator history recording for the first training step only."""
     global _HISTORY_ACTIVE, _HISTORY_START_BLOCKS, _HISTORY_START_ERROR
+    path = _history_path()
+    if path is None or _HISTORY_DONE or _HISTORY_ACTIVE:
+        return
+    rank_zero = _rank_zero(cp_group) if cp_group is not None else _rank_zero()
+    if not rank_zero or not torch.cuda.is_available():
+        return
     try:
         torch.cuda.memory._record_memory_history(max_entries=_HISTORY_MAX_ENTRIES)
         _HISTORY_ACTIVE = True

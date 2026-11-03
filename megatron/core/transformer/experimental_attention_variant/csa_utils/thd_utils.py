@@ -225,9 +225,11 @@ class CSA2THDLayout:
         # Every physical rank publishes the same cumulative coordinate space.
         # At chunk_index=0 this is exactly the unchunked CP span.
         span = (self.chunk_index + 1) * self.global_total_tokens
-        capacity = get_thd_compressed_capacity(
-            span, max(self.max_seqlen, span), num_sequences, ratio
-        )
+        # A chunked pass addresses positions across the whole timeline up to its own end,
+        # so its per-sequence bound must cover the span. An unchunked pass keeps the
+        # max_seqlen bound; widening it would size padded packs by token capacity alone.
+        seq_bound = max(self.max_seqlen, span) if self.chunk_count > 1 else self.max_seqlen
+        capacity = get_thd_compressed_capacity(span, seq_bound, num_sequences, ratio)
         cu_physical = get_thd_compressed_cu_seqlens(self.cu_seqlens_padded, ratio)
         sources, local_groups, sequence_ids, assigned = get_thd_compressed_group_indices(
             self.cu_seqlens_padded, cu_physical, ratio, capacity
@@ -301,6 +303,45 @@ class CSA2THDLayout:
 # the validation once per distinct metadata object instead of once per layer.
 _THD_LAYOUT_CACHE: dict = {}
 _THD_LAYOUT_CACHE_MAX = 64
+# Every PackedSeqParams field the build reads. A cached layout is reused only while
+# each of them is unchanged, so a reused metadata object with new values rebuilds.
+_THD_LAYOUT_INPUT_FIELDS = (
+    "qkv_format",
+    "cp_group",
+    "local_cp_size",
+    "cp_partition_mode",
+    "cp_chunk_index",
+    "cp_chunk_count",
+    "cu_seqlens_q",
+    "cu_seqlens_kv",
+    "cu_seqlens_q_padded",
+    "cu_seqlens_kv_padded",
+    "max_seqlen_q",
+    "max_seqlen_kv",
+    "chunk_tape",
+)
+
+
+def _thd_layout_inputs(packed_seq_params: PackedSeqParams) -> tuple:
+    """Snapshot the build inputs; tensors carry their in-place version counter."""
+    inputs = []
+    for name in _THD_LAYOUT_INPUT_FIELDS:
+        value = getattr(packed_seq_params, name, None)
+        # Inference tensors have no version counter; they are compared by identity.
+        tracks_version = isinstance(value, Tensor) and not value.is_inference()
+        inputs.append((value, value._version if tracks_version else None))
+    return tuple(inputs)
+
+
+def _same_thd_layout_inputs(cached: tuple, current: tuple) -> bool:
+    """Whether a snapshot still describes the current inputs."""
+    for (old, old_version), (new, new_version) in zip(cached, current):
+        if old is new:
+            if old_version != new_version:
+                return False
+        elif isinstance(old, Tensor) or isinstance(new, Tensor) or old != new:
+            return False
+    return True
 
 
 def build_csa2_thd_layout(
@@ -320,16 +361,21 @@ def build_csa2_thd_layout(
         getattr(packed_seq_params, "cp_chunk_index", 0),
         getattr(packed_seq_params, "cp_chunk_count", 1),
     )
+    inputs = _thd_layout_inputs(packed_seq_params)
     hit = _THD_LAYOUT_CACHE.get(key)
     if hit is not None:
-        ref_psp, ref_group, layout = hit
-        if ref_psp is packed_seq_params and ref_group is cp_group:
+        ref_psp, ref_group, ref_inputs, layout = hit
+        if (
+            ref_psp is packed_seq_params
+            and ref_group is cp_group
+            and _same_thd_layout_inputs(ref_inputs, inputs)
+        ):
             return layout
     layout = _build_csa2_thd_layout(packed_seq_params, total_tokens, cp_group=cp_group)
     if len(_THD_LAYOUT_CACHE) >= _THD_LAYOUT_CACHE_MAX:
         _THD_LAYOUT_CACHE.clear()
     # Hold strong references so the identity keys cannot be recycled while cached.
-    _THD_LAYOUT_CACHE[key] = (packed_seq_params, cp_group, layout)
+    _THD_LAYOUT_CACHE[key] = (packed_seq_params, cp_group, inputs, layout)
     return layout
 
 

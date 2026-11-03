@@ -66,6 +66,8 @@ def profile(monkeypatch):
     monkeypatch.delenv("DSV41_MEM_HISTORY", raising=False)
     monkeypatch.setattr(module, "_ENABLED", True, raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # The probes print on global rank zero only; unit tests run on every rank.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 1000)
     monkeypatch.setattr(module, "phase", lambda _: None, raising=False)
     monkeypatch.setattr(module, "_GB", 1)
@@ -217,6 +219,33 @@ def test_history_records_before_step_and_dumps_then_disables(profile, monkeypatc
     assert saved_snapshot["history_max_entries"] == profile._HISTORY_MAX_ENTRIES
     assert saved_snapshot["history_start_blocks"] == []
     assert saved_snapshot["history_start_error"] is None
+    assert calls == [
+        ("record", {"max_entries": profile._HISTORY_MAX_ENTRIES}),
+        ("dump", str(history_path)),
+        ("record", {"enabled": None}),
+    ]
+
+
+def test_history_records_only_the_first_step(profile, monkeypatch, tmp_path):
+    history_path = tmp_path / "step.pickle"
+    monkeypatch.setenv("DSV41_MEM_HISTORY", str(history_path))
+    calls = []
+    monkeypatch.setattr(
+        torch.cuda.memory,
+        "_record_memory_history",
+        lambda **kwargs: calls.append(("record", kwargs)),
+    )
+    monkeypatch.setattr(profile, "_capture_history_start_blocks", lambda: [])
+
+    def dump(path):
+        calls.append(("dump", path))
+        Path(path).write_bytes(pickle.dumps({"segments": [], "device_traces": [[]]}))
+
+    monkeypatch.setattr(torch.cuda.memory, "_dump_snapshot", dump)
+    cp_group = SimpleNamespace(rank=lambda: 0)
+    for _ in range(3):
+        profile.step_start(cp_group)
+        profile.step_end(object(), object(), cp_group=cp_group)
     assert calls == [
         ("record", {"max_entries": profile._HISTORY_MAX_ENTRIES}),
         ("dump", str(history_path)),

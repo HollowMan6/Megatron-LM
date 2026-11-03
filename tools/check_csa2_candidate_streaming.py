@@ -50,6 +50,8 @@ def load_streaming():
         _SELECT_ROW_CHUNK_ELEMENTS=256,
         _CAUSAL_LIMIT_CACHE={},
         _CAUSAL_LIMIT_CACHE_MAX=64,
+        _SLOT_COUNT_CACHE={},
+        _SLOT_COUNT_CACHE_MAX=64,
     )
     tree = ast.parse(FUSED_SOURCE.read_text())
     definitions = [
@@ -59,6 +61,7 @@ def load_streaming():
         and node.name
         in {
             "_causal_key_limit",
+            "_sequence_slot_count",
             "_streaming_indexer_topk",
             "_chunked_csa2_indexer_scores",
             "_chunked_candidate_block_scores",

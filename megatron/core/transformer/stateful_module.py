@@ -8,25 +8,15 @@ code owns their meaning, while eager, checkpoint and graph execution use the
 same tensor signature. The module never retains a forward's state mapping.
 """
 
-import contextlib
 import gc
-from contextlib import contextmanager
-from typing import Mapping
+from contextlib import ExitStack, contextmanager, nullcontext
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
 from megatron.core.tensor_observation import suspend_tensor_observations
-# Imported lazily (see _te_fp8): a module-level transformer_engine import here
-# measurably slows Megatron's package import because TE initialises cuDNN/cuBLAS.
-def _te_fp8():
-    """Return (FP8GlobalStateManager, fp8_autocast), or (None, None) without TE."""
-    try:
-        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
-        return FP8GlobalStateManager, fp8_autocast
-    except (ImportError, ModuleNotFoundError):
-        return None, None
 from megatron.core.tensor_parallel import random as rng
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 
@@ -67,7 +57,10 @@ class StatefulModule(nn.Module):
         if recompute and torch.is_grad_enabled():
             if hidden.is_cuda and torch.cuda.is_current_stream_capturing():
                 raise ValueError("Stateful full recomputation cannot be nested in CUDA capture")
-            result = checkpoint(self, *args, use_reentrant=False, context_fn=_checkpoint_contexts)
+            with _checkpoint_replay_scope():
+                result = checkpoint(
+                    self, *args, use_reentrant=False, context_fn=_checkpoint_contexts
+                )
         else:
             result = self(*args)
         return self.restore_result(result, state)
@@ -81,16 +74,43 @@ class StatefulModule(nn.Module):
         return result[0], updated
 
 
-def _checkpoint_contexts():
-    """Preserve Megatron's model-parallel RNG and the FP8 context across replay.
+def _active_fp8_recipe() -> Any:
+    """Return the active TE quantization recipe, or ``None`` when quantization is off."""
+    if rng.HAVE_TE and rng.FP8GlobalStateManager.is_fp8_enabled():
+        return rng.FP8GlobalStateManager.get_fp8_recipe()
+    return None
 
-    PyTorch's default RNG is handled by checkpoint itself; Megatron's model-parallel
-    tracker is added here. The quantized (FP8/FP4) context is captured as well: with
-    ``use_reentrant=False`` the replay runs the block OUTSIDE whatever ``fp8_autocast``
-    wrapped the original call, so without restoring it the replay would run in BF16
-    while the persistent FP8 weights (``fp8_param``) keep their block scales, and the
-    first backward would then assert on incompatible scaling modes in the GEMM.
+
+def _checkpoint_replay_scope():
+    """Wrap a ``_checkpoint_contexts`` checkpoint call so a quantized replay completes.
+
+    TE restores delayed-scaling metadata when each module's forward ends, which
+    checkpoint early stop can skip.
     """
+    return nullcontext() if _active_fp8_recipe() is None else set_checkpoint_early_stop(False)
+
+
+@contextmanager
+def _quantized_checkpoint_phase(fp8_recipe: Any, *, replay: bool):
+    """Enter TE's activation-recompute phase, and on replay the recorded recipe.
+
+    This mirrors TE's own non-reentrant checkpoint. The original forward stashes
+    delayed-scaling metadata for the replay. The replay runs during backward,
+    outside the caller's ``fp8_autocast``, so it re-enters the recorded recipe;
+    otherwise it would run unquantized against persistent FP8 weights.
+    """
+    with ExitStack() as stack:
+        if fp8_recipe is not None:
+            stack.enter_context(
+                rng.activation_recompute_forward(activation_recompute=True, recompute_phase=replay)
+            )
+            if replay:
+                stack.enter_context(rng.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe))
+        yield
+
+
+def _checkpoint_contexts():
+    """Preserve Megatron's model-parallel RNG and TE's quantization recipe for replay."""
     saved = {}
 
     def clone_states(states):
@@ -103,17 +123,12 @@ def _checkpoint_contexts():
     @contextmanager
     def forward():
         saved["tracker"] = clone_states(rng.get_cuda_rng_tracker().get_states())
-        _gsm, _ = _te_fp8()
-        if _gsm is not None:
-            saved["fp8"] = _gsm.is_fp8_enabled()
-            saved["fp8_recipe"] = _gsm.get_fp8_recipe() if saved["fp8"] else None
-        else:
-            saved["fp8"] = False
-            saved["fp8_recipe"] = None
+        saved["fp8_recipe"] = _active_fp8_recipe()
         previous = rng.is_checkpointing()
         rng._set_checkpointing()
         try:
-            yield
+            with _quantized_checkpoint_phase(saved["fp8_recipe"], replay=False):
+                yield
         finally:
             if not previous:
                 rng._unset_checkpointing()
@@ -124,13 +139,11 @@ def _checkpoint_contexts():
         previous_states, previous = tracker.get_states(), rng.is_checkpointing()
         tracker.set_states(clone_states(saved["tracker"]))
         rng._set_checkpointing()
-        _, _fp8_autocast = _te_fp8()
-        if saved.get("fp8") and _fp8_autocast is not None:
-            fp8_ctx = _fp8_autocast(enabled=True, fp8_recipe=saved["fp8_recipe"])
-        else:
-            fp8_ctx = contextlib.nullcontext()
         try:
-            with fp8_ctx, suspend_tensor_observations():
+            with (
+                _quantized_checkpoint_phase(saved["fp8_recipe"], replay=True),
+                suspend_tensor_observations(),
+            ):
                 yield
         finally:
             tracker.set_states(previous_states)

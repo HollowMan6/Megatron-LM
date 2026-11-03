@@ -6,8 +6,10 @@ published inference implementation and does not call the CSA2 attention operator
 """
 
 import math
+import warnings
 from contextlib import nullcontext
 from copy import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1638,6 +1640,182 @@ def _dense_thd_select(q, indexer_k, weights, thd, comp, ratio, topk, candidates=
     return CSA2Indexer.select_indices(SimpleNamespace(topk=topk), selected), scores
 
 
+@pytest.mark.parametrize(
+    ("cu_seqlens", "max_seqlen", "total_tokens", "cp_size"),
+    [
+        # Static-shape cumulative lengths: zero-length trailing entries and a padding tail.
+        ([0, 100, 150, 150, 150, 150, 150, 150, 150], 100, 512, 1),
+        # CP rank 0 of 2 holds only sequence 0; the trailing 1-token sequence owns no group.
+        ([0, 128, 129], 128, 128, 2),
+    ],
+    ids=["zero-length-tail", "cp-groupless-trailing-sequence"],
+)
+def test_streaming_topk_keeps_unassigned_tail_keys_in_the_block_table(
+    cu_seqlens, max_seqlen, total_tokens, cp_size
+):
+    """Capacity-tail keys stay inside the K=1 sequence-local block table.
+
+    The table has one slot per sequence that owns rows or groups. The keys past the
+    last group belong to no sequence; addressing them by their absolute index ran past
+    the table whenever the trailing sequences owned no compressed group.
+    """
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(7)
+    ratio, topk, block_size = 2, 8, 64
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device="cuda")
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu.clone(),
+        cu_seqlens_q_padded=cu.clone(),
+        cu_seqlens_kv_padded=cu.clone(),
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        cp_partition_mode="contiguous",
+    )
+    # The layout only reads the group's size and rank; rank 0's rows never reach the
+    # trailing sequence.
+    cp_group = SimpleNamespace(size=lambda: cp_size, rank=lambda: 0) if cp_size > 1 else None
+    thd = build_csa2_thd_layout(params, total_tokens, cp_group=cp_group)
+    comp = thd.for_compression(ratio)
+    n_slots = max(int(thd.sequence_ids.max()), int(comp.sequence_ids.max())) + 1
+    n_blocks = -(-comp.max_seqlen // block_size)
+    tail = (comp.sequence_ids < 0).nonzero().flatten()
+    assert int(tail.max()) // block_size >= n_slots * n_blocks, "tail must reach past the table"
+
+    s, keys, h, d = total_tokens, comp.capacity, 2, 16
+    q = torch.randn(s, 1, h, d, device="cuda", generator=gen)
+    indexer_k = torch.randn(keys, 1, d, device="cuda", generator=gen)
+    weights = torch.randn(s, 1, h, device="cuda", generator=gen)
+
+    scores = csa2_module._chunked_csa2_indexer_scores(q, indexer_k, weights)
+    causal = (
+        thd.valid_tokens[:, None]
+        & comp.valid_groups[None, :]
+        & (thd.sequence_ids[:, None] == comp.sequence_ids[None, :])
+        & (comp.position_ids[None, :] + ratio <= thd.position_ids[:, None] + 1)
+    )
+    scores = scores.masked_fill(~causal, -torch.inf)
+
+    def dense_select(masked):
+        k = min(topk, masked.shape[-1])
+        order = masked.reshape(-1, masked.shape[-1]).argsort(dim=-1, descending=True, stable=True)
+        picked = order[..., :k].sort(dim=-1).values.reshape(1, s, k)
+        return picked.masked_fill(~masked.gather(-1, picked).isfinite(), -1).int()
+
+    ids = torch.randint(0, n_blocks, (1, s, 2), dtype=torch.int32, device="cuda", generator=gen)
+    cand = CSA2CandidateBlocks(ids, block_size)
+    cand_mask = cand.to_mask_thd(thd.sequence_ids, comp.sequence_ids, comp.position_ids // ratio)
+
+    got, got_blocks = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, None, True, block_size
+    )
+    got_c, _ = csa2_module._streaming_indexer_topk(
+        q, indexer_k, weights, topk, ratio, thd, comp, cand, False, block_size
+    )
+
+    torch.testing.assert_close(got, dense_select(scores), rtol=0, atol=0)
+    ref_blocks = csa2_module._dense_candidate_block_scores(scores, thd, comp, block_size)
+    torch.testing.assert_close(got_blocks, ref_blocks, rtol=0, atol=0)
+    ref_c = dense_select(scores.masked_fill(~cand_mask, -torch.inf))
+    torch.testing.assert_close(got_c, ref_c, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("chunk_count", [1, 2], ids=["k1", "k2-streamed"])
+@pytest.mark.parametrize("want_block_scores", [False, True], ids=["consumer", "source"])
+def test_streaming_topk_host_syncs_do_not_grow_with_the_pack(
+    monkeypatch, chunk_count, want_block_scores
+):
+    """The fused select reads the device a fixed number of times per call.
+
+    Neither the live tiles nor the merge stages and their block buckets may each
+    synchronise the host, and the per-layout values are read once per layout pair: a
+    pack with four times the keys syncs exactly as often, at most three times per call.
+    """
+    import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_module
+
+    # Small stages and buckets, so even the small pack spans several of each.
+    monkeypatch.setattr(csa2_module, "_SELECT_MERGE_STAGE_KEYS", 64)
+    monkeypatch.setattr(csa2_module, "_CANDIDATE_BLOCK_CHUNK_SIZE", 4)
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(11)
+    block_size = 3
+
+    def inputs(scale):
+        capacities = [65 * scale, 47 * scale, 19 * scale]
+        rows = 3 * len(capacities)
+        keys = sum(capacities)
+        valid_rows = torch.ones(rows, dtype=torch.bool)
+        valid_rows[-1] = False
+        valid_groups = torch.ones(keys, dtype=torch.bool)
+        valid_groups[-2:] = False
+        thd = SimpleNamespace(
+            sequence_ids=torch.arange(len(capacities)).repeat_interleave(3).cuda(),
+            position_ids=torch.tensor(
+                [p for c in capacities for p in (0, 2 * c - 1, 2 * c - 3)]
+            ).cuda(),
+            valid_tokens=valid_rows.cuda(),
+            chunk_count=chunk_count,
+        )
+        comp = SimpleNamespace(
+            cu_seqlens_padded=torch.tensor(
+                [0, *torch.tensor(capacities).cumsum(0).tolist()]
+            ).cuda(),
+            total_tokens=keys,
+            max_seqlen=max(capacities),
+            valid_groups=valid_groups.cuda(),
+            sequence_ids=torch.cat([torch.full((c,), i) for i, c in enumerate(capacities)]).cuda(),
+            position_ids=torch.cat([2 * torch.arange(c) for c in capacities]).cuda(),
+        )
+        q = torch.randn(rows, 1, 2, 4, device="cuda", generator=gen)
+        indexer_k = torch.randn(keys, 1, 4, device="cuda", generator=gen)
+        weights = torch.randn(rows, 1, 2, device="cuda", generator=gen)
+        ids = torch.tensor([0, 2, 5, 9], dtype=torch.int32).expand(rows, 4).clone()
+        ids[-1] = -1
+        candidates = None if want_block_scores else CSA2CandidateBlocks(ids.cuda(), block_size)
+        return (
+            q,
+            indexer_k,
+            weights,
+            8,
+            2,
+            thd,
+            comp,
+            candidates,
+            want_block_scores,
+            block_size,
+            4,
+        )
+
+    # Count only the syncs Megatron code issues: PyTorch can add a one-time internal one
+    # the first time the debug mode reports.
+    megatron_root = Path(csa2_module.__file__).resolve().parents[3]
+
+    def count_syncs(args):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                csa2_module._streaming_indexer_topk(*args)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        return sum(
+            "synchroniz" in str(w.message)
+            and Path(w.filename).resolve().is_relative_to(megatron_root)
+            for w in caught
+        )
+
+    counts = []
+    for scale in (1, 4):
+        args = inputs(scale)
+        csa2_module._streaming_indexer_topk(*args)  # fill the per-layout caches
+        counts.append(count_syncs(args))
+    assert counts[0] == counts[1], f"host syncs grow with the pack: {counts}"
+    assert counts[1] <= 3, f"too many host syncs per call: {counts}"
+
+
 def test_streaming_topk_pads_the_selection_to_k():
     """A pack with fewer live keys than k keeps the dense select's fixed width.
 
@@ -2418,6 +2596,35 @@ def test_thd_cp_compression_keeps_global_groups_and_gradients(ratio):
     x.grad = None
     expected.sum().backward()
     torch.testing.assert_close(actual_grad, x.grad, atol=0, rtol=0)
+
+
+def test_thd_layout_cache_rebuilds_when_reused_metadata_changes():
+    """A PackedSeqParams reused with new boundaries must not return the old layout."""
+
+    def packed(boundaries, max_seqlen):
+        return PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=boundaries,
+            cu_seqlens_kv=boundaries,
+            cu_seqlens_q_padded=boundaries,
+            cu_seqlens_kv_padded=boundaries,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+
+    boundaries = torch.tensor([0, 4, 8], dtype=torch.int32)
+    params = packed(boundaries, 5)
+    first = build_csa2_thd_layout(params, 8)
+    assert build_csa2_thd_layout(params, 8) is first
+
+    # Refill the same buffer in place for the next micro-batch, as a static-input
+    # loader does; no attribute of the metadata object changes.
+    boundaries.copy_(torch.tensor([0, 3, 8], dtype=torch.int32))
+    second = build_csa2_thd_layout(params, 8)
+    expected = build_csa2_thd_layout(packed(torch.tensor([0, 3, 8], dtype=torch.int32), 5), 8)
+    assert second is not first
+    for name in ("sequence_ids", "position_ids", "valid_tokens"):
+        torch.testing.assert_close(getattr(second, name), getattr(expected, name), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("chunk_index", [0, 1])

@@ -625,8 +625,15 @@ class CheckpointFunction(torch.autograd.Function):
         else:
             ctx.fp8 = False
             ctx.fp8_recipe = None
+        # The recompute phase in backward restores delayed-scaling metadata that TE
+        # stashes only when this first forward runs in the activation-recompute phase.
+        fwd_ctx = (
+            activation_recompute_forward(activation_recompute=True, recompute_phase=False)
+            if ctx.fp8
+            else contextlib.nullcontext()
+        )
 
-        with torch.no_grad():
+        with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
 
         # Divide hidden states across model parallel group and only keep

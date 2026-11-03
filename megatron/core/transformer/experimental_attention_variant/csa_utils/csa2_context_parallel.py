@@ -50,7 +50,8 @@ class _LeftBoundaryExchange(torch.autograd.Function):
             )
             boundary = tail.new_zeros(tail.shape)
             if rank > 0:
-                boundary = gathered[rank - 1]
+                # Copy out so the halo does not keep every rank's tail alive.
+                boundary = gathered[rank - 1].clone()
         else:
             gathered = tail.unsqueeze(0)
             boundary = torch.zeros_like(tail)
@@ -92,101 +93,6 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         return grad_input, None, None, None, None
 
 
-class _HaloGrad(torch.autograd.Function):
-    """Attach the halo gradient exchange to an already-completed receive buffer.
-
-    The transfer itself is issued by :func:`start_csa2_boundary_exchange` (so it can
-    overlap with the caller's projections) and awaited by
-    :func:`finish_csa2_boundary_exchange`. This node only carries autograd: its
-    forward is the identity on ``received`` (which is a function of ``hidden``
-    because ``hidden``'s tail was sent to the same peer), and its backward returns
-    the neighbor's halo gradient exactly like the blocking implementation.
-    """
-
-    @staticmethod
-    def forward(ctx, hidden: Tensor, received: Tensor, halo_rows: int, cp_group):
-        ctx.cp_group = cp_group
-        ctx.halo_rows = halo_rows
-        ctx.input_shape = hidden.shape
-        return received
-
-    @staticmethod
-    def backward(ctx, grad_boundary: Tensor):
-        group = ctx.cp_group
-        rank, size = group.rank(), group.size()
-        grad_input = grad_boundary.new_zeros(ctx.input_shape)
-        ops = []
-        received = None
-        if rank > 0:
-            ops.append(
-                dist.P2POp(
-                    dist.isend,
-                    grad_boundary.contiguous(),
-                    dist.get_global_rank(group, rank - 1),
-                    group,
-                )
-            )
-        if rank + 1 < size:
-            received = grad_boundary.new_empty(grad_boundary.shape)
-            ops.append(
-                dist.P2POp(dist.irecv, received, dist.get_global_rank(group, rank + 1), group)
-            )
-        for request in dist.batch_isend_irecv(ops):
-            request.wait()
-        if received is not None:
-            grad_input[-ctx.halo_rows :] = received
-        return grad_input, None, None, None
-
-
-class CSA2BoundaryExchange:
-    """Handle for an in-flight left-boundary halo exchange."""
-
-    __slots__ = ("hidden", "recv", "requests", "halo_rows", "cp_group")
-
-    def __init__(self, hidden, recv, requests, halo_rows, cp_group):
-        self.hidden = hidden
-        self.recv = recv
-        self.requests = requests
-        self.halo_rows = halo_rows
-        self.cp_group = cp_group
-
-
-def start_csa2_boundary_exchange(
-    hidden: Tensor, halo_rows: int, cp_group: dist.ProcessGroup
-) -> CSA2BoundaryExchange:
-    """Issue the halo send/recv without waiting, so it overlaps the caller's compute.
-
-    ``hidden`` must not be modified in place until :func:`finish_csa2_boundary_exchange`
-    is called: the sent tail is snapshotted by ``contiguous()`` here, but the caller
-    still owns the tensor.
-    """
-    if hidden.shape[0] < halo_rows:
-        raise ValueError("CSA2 CP local rows must cover the attention halo")
-    rank, size = cp_group.rank(), cp_group.size()
-    recv = hidden.new_zeros((halo_rows,) + hidden.shape[1:])
-    ops = []
-    if rank > 0:
-        ops.append(dist.P2POp(dist.irecv, recv, dist.get_global_rank(cp_group, rank - 1), cp_group))
-    if rank + 1 < size:
-        ops.append(
-            dist.P2POp(
-                dist.isend,
-                hidden[-halo_rows:].contiguous(),
-                dist.get_global_rank(cp_group, rank + 1),
-                cp_group,
-            )
-        )
-    requests = dist.batch_isend_irecv(ops) if ops else []
-    return CSA2BoundaryExchange(hidden, recv, requests, halo_rows, cp_group)
-
-
-def finish_csa2_boundary_exchange(handle: CSA2BoundaryExchange) -> Tensor:
-    """Await the in-flight exchange and return the halo with its gradient path."""
-    for request in handle.requests:
-        request.wait()
-    return _HaloGrad.apply(handle.hidden, handle.recv, handle.halo_rows, handle.cp_group)
-
-
 def exchange_csa2_boundary_hidden(
     hidden: Tensor,
     halo_rows: int,
@@ -222,22 +128,9 @@ class CSA2CPCompressionLayout:
         """Select each group's unique owner, retaining the all-gather autograd edge."""
         if gathered.shape[0] != self.local.cp_size * self.local.capacity:
             raise ValueError("CSA2 gathered K must match the rank-major compression capacity")
-        # index_select requires every index in [0, rows). Invalid groups are already addressed
-        # as 0 by the layout builder, so an out-of-range index here never means "unowned" - it
-        # means the mapping for a VALID group is wrong, and silently clamping it would turn a
-        # layout bug into a wrong value. Fail fast instead, and only substitute a safe address
-        # for rows that are masked to zero afterwards anyway.
-        valid = self.global_layout.valid_groups
-        indices = self.gather_indices
-        bad = valid & ((indices < 0) | (indices >= gathered.shape[0]))
-        if bool(bad.any().item()):
-            _first = int(bad.nonzero().flatten()[0])
-            raise ValueError(
-                f"valid CSA2 group {_first} maps to gathered row {int(indices[_first])} "
-                f"outside [0, {gathered.shape[0]}) "
-                f"(capacity={self.local.capacity}, cp_size={self.local.cp_size})"
-            )
-        output = gathered.index_select(0, indices.masked_fill(~valid, 0))
+        # build_csa2_cp_compression_layout addresses invalid groups as row 0 and checks that
+        # every index lies inside the gathered rows, whose count is pinned just above.
+        output = gathered.index_select(0, self.gather_indices)
         invalid = ~self.global_layout.valid_groups.reshape(-1, *([1] * (gathered.ndim - 1)))
         return output.masked_fill(invalid, 0)
 
@@ -322,4 +215,17 @@ def build_csa2_cp_compression_layout(
         ).masked_fill(
             ~global_layout.valid_groups | (virtual_owner // tokens.cp_size != tokens.chunk_index), 0
         )
+        # Invalid and other-pass groups read row 0 and are masked or replaced afterwards, so
+        # an index outside the gathered rows means a VALID group's mapping is wrong. Check it
+        # once per layout, without a host sync on CUDA.
+        gathered_rows = tokens.cp_size * capacity
+        bad = (gather_indices < 0) | (gather_indices >= gathered_rows)
+        message = (
+            f"a valid CSA2 group maps outside the gathered rows [0, {gathered_rows}) "
+            f"(capacity={capacity}, cp_size={tokens.cp_size})"
+        )
+        if bad.is_cuda:
+            torch._assert_async(~bad.any(), message)
+        elif bool(bad.any()):
+            raise ValueError(message)
     return CSA2CPCompressionLayout(local, global_layout, gather_indices)

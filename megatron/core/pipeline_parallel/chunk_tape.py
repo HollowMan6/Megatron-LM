@@ -115,10 +115,8 @@ class ChunkTape:
         return sizes, aliases
 
     def _report_tape_memory(self) -> None:
-        """Print the final logical-step ledger on CP rank zero."""
-        from megatron.core.parallel_state import get_context_parallel_rank
-
-        if get_context_parallel_rank() != 0:
+        """Print the final logical-step ledger on global rank zero."""
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return
         sizes, aliases = self.accounting()
         required = ("values.indexer_k", "values.global_kv")

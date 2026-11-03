@@ -130,6 +130,35 @@ def _causal_key_limit(thd_layout, compressed_layout, keys: int) -> int:
     return value
 
 
+# The fused select's sequence slot count depends only on the two layouts, like the causal
+# limit above, so it is cached the same way instead of read from the device in every layer.
+_SLOT_COUNT_CACHE: dict = {}
+_SLOT_COUNT_CACHE_MAX = 64
+
+
+def _sequence_slot_count(thd_layout, compressed_layout) -> int:
+    """Return the number of sequence slots the fused select addresses, once per layout pair.
+
+    The slot space is addressed by the rows' sequence ids and by the compressed keys', so it
+    covers the largest of both; at least one slot keeps the empty and all -1 cases valid.
+    """
+    key = (id(thd_layout), id(compressed_layout))
+    hit = _SLOT_COUNT_CACHE.get(key)
+    if hit is not None:
+        ref_thd, ref_comp, value = hit
+        if ref_thd is thd_layout and ref_comp is compressed_layout:
+            return value
+    maxima = [
+        ids.max().to(torch.int64) if ids.numel() else ids.new_full((), -1, dtype=torch.int64)
+        for ids in (thd_layout.sequence_ids, compressed_layout.sequence_ids)
+    ]
+    value = max(*torch.stack(maxima).tolist(), 0) + 1
+    if len(_SLOT_COUNT_CACHE) >= _SLOT_COUNT_CACHE_MAX:
+        _SLOT_COUNT_CACHE.clear()
+    _SLOT_COUNT_CACHE[key] = (thd_layout, compressed_layout, value)
+    return value
+
+
 def _chunked_csa2_indexer_scores(
     q: torch.Tensor, indexer_k: torch.Tensor, weights: torch.Tensor, key_chunk_size: int = 64
 ) -> torch.Tensor:
@@ -295,19 +324,14 @@ def _streaming_indexer_topk(
 
     # Candidate membership in the sequence-local block slot space, so each
     # chunk costs one gather instead of a full [s, keys] expansion.
-    # Sized from the layout's key space, not from one sequence's max length: a chunked pass
-    # addresses keys from the start of the timeline to its own end (capacity spans
-    # global_start + total_tokens), so key_local // block_size reaches further than one
-    # sequence's blocks. Sizing it per sequence is what made member[...] index past the table
-    # and trip a device-side assert at K=2.
-    # Widen to the larger of the two spans. A chunked pass addresses keys from the start of
-    # the timeline up to its own end, so `total_tokens` alone is what keeps `member[...]`
-    # inside the table at K=2; a whole-sequence pass is bounded by `max_seqlen`, and some
-    # callers build a layout that only carries the latter. Taking the maximum satisfies both
-    # without the AttributeError that a bare `total_tokens` read raises on those layouts.
-    _key_span = max(
-        int(getattr(compressed_layout, "total_tokens", 0) or 0), int(compressed_layout.max_seqlen)
-    )
+    # A whole-sequence pass is bounded by one sequence's `max_seqlen`, which keeps its block
+    # scores the same width as the dense reduction's. A chunked pass (K > 1) addresses keys
+    # from the start of the timeline up to its own end, so its table must also cover
+    # `total_tokens`; sizing it per sequence made member[...] index past the table and trip
+    # a device-side assert at K=2. Some layouts carry no `total_tokens`, hence the default.
+    _key_span = int(compressed_layout.max_seqlen)
+    if getattr(thd_layout, "chunk_count", 1) > 1:
+        _key_span = max(_key_span, int(getattr(compressed_layout, "total_tokens", 0) or 0))
     n_local_blocks = -(-_key_span // candidate_block_size) if candidate_block_size > 0 else 0
     # The slot space below is addressed by the ROW sequence ids (candidate
     # membership and the block table read) as well as by the compressed keys'
@@ -319,8 +343,20 @@ def _streaming_indexer_topk(
     # selection is all -1. The clamp keeps the empty/-1-only cases at one slot.
     n_slots = 0
     if isinstance(candidates, CSA2CandidateBlocks) or want_block_scores:
-        n_slots = (
-            max(int(rows_seq.max().item()), int(compressed_layout.sequence_ids.max().item()), 0) + 1
+        n_slots = _sequence_slot_count(thd_layout, compressed_layout)
+    n_table = n_slots * n_local_blocks
+    # Each row's candidate blocks as flat slots. Invalid entries point one past the table, at
+    # a spare column that every write below drops, so building membership never needs a
+    # masked index (each of which reads the device).
+    cand_ids = cand_flat = None
+    if isinstance(candidates, CSA2CandidateBlocks):
+        if candidate_block_size != candidates.block_size:
+            raise ValueError("candidate block size mismatch with the candidate set")
+        cand_ids = candidates.indices.reshape(s, -1)
+        cand_flat = torch.where(
+            cand_ids >= 0,
+            rows_seq.clamp_min(0)[:, None] * n_local_blocks + cand_ids.long(),
+            n_table,
         )
     # Preserve the original full-table graph for K=1 and tables no wider than C.
     stream_blocks = (
@@ -338,23 +374,12 @@ def _streaming_indexer_topk(
         )
     compact_member = stream_blocks and isinstance(candidates, CSA2CandidateBlocks)
     if compact_member:
-        if candidate_block_size != candidates.block_size:
-            raise ValueError("candidate block size mismatch with the candidate set")
         member = None
         member_of_chunk = None
     elif isinstance(candidates, CSA2CandidateBlocks):
-        if candidate_block_size != candidates.block_size:
-            raise ValueError("candidate block size mismatch with the candidate set")
-        member = torch.zeros((s, n_slots * n_local_blocks), dtype=torch.bool, device=q.device)
-        ids = candidates.indices
-        valid_ids = ids >= 0
-        member[
-            torch.arange(s, device=q.device).unsqueeze(-1).expand_as(ids)[valid_ids],
-            (
-                rows_seq.clamp_min(0).unsqueeze(-1).expand_as(ids)[valid_ids] * n_local_blocks
-                + ids[valid_ids].long()
-            ),
-        ] = True
+        member = torch.zeros((s, n_table + 1), dtype=torch.bool, device=q.device)
+        member.scatter_(1, cand_flat, True)
+        member = member[:, :n_table]
         member_of_chunk = None  # built per chunk below from `member`
     else:
         member = None
@@ -362,6 +387,7 @@ def _streaming_indexer_topk(
 
     block_table = None
     slot_of_key = None
+    key_assigned = None
     if want_block_scores or member is not None or compact_member:
         if want_block_scores and not stream_blocks:
             # Explicit legacy fallback: K=1 or at most C local blocks.
@@ -372,20 +398,23 @@ def _streaming_indexer_topk(
         # this pass's span; derive the arange length from the layout so both sides of the
         # subtraction agree.
         _n_keys = min(int(keys), int(compressed_layout.sequence_ids.numel()))
+        key_seq = compressed_layout.sequence_ids[:_n_keys]
+        key_assigned = key_seq >= 0
         key_local = (
             torch.arange(_n_keys, device=q.device)
-            - compressed_layout.cu_seqlens_padded[
-                compressed_layout.sequence_ids.clamp_min(0)[:_n_keys]
-            ]
+            - compressed_layout.cu_seqlens_padded[key_seq.clamp_min(0)]
         )
-        slot_of_key = (
-            compressed_layout.sequence_ids.clamp_min(0) * n_local_blocks
-            + key_local // candidate_block_size
-        )
+        # Capacity-tail keys belong to no sequence. Counted from sequence 0 they address the
+        # table by their absolute index, which runs past a K=1 table sized per sequence
+        # whenever the sequences after the last occupied slot own no compressed group. They
+        # are never causally visible (`valid_groups` is False there), so park them in slot 0,
+        # where their -inf scores leave the block maxima unchanged.
+        key_local = key_local.masked_fill(~key_assigned, 0)
+        slot_of_key = key_seq.clamp_min(0) * n_local_blocks + key_local // candidate_block_size
 
     block_bucket = None
     local_block_table = None
-    row_ids = torch.arange(s, device=q.device)
+    local_block_width = 0  # local_block_table has one more, spare column
 
     def finish_block_bucket():
         if local_block_table is None:
@@ -393,7 +422,7 @@ def _streaming_indexer_topk(
         # A flattened bucket can straddle sequence slots. Rank only each row's
         # own sequence, translating back to the original local block IDs.
         lo = block_bucket * _CANDIDATE_BLOCK_CHUNK_SIZE
-        hi = lo + local_block_table.shape[-1]
+        hi = lo + local_block_width
         for seq in range(lo // n_local_blocks, (hi - 1) // n_local_blocks + 1):
             begin, end = max(lo, seq * n_local_blocks), min(hi, (seq + 1) * n_local_blocks)
             rolling_blocks.update(
@@ -429,35 +458,34 @@ def _streaming_indexer_topk(
     if (member is not None or compact_member) and slot_of_key is not None:
         if compact_member:
             # Only a 1-D liveness vector; no row-by-block membership table.
-            any_member = torch.zeros(n_slots * n_local_blocks, dtype=torch.bool, device=q.device)
-            ids = candidates.indices
-            flat_ids = rows_seq.clamp_min(0)[:, None] * n_local_blocks + ids.long()
-            any_member[flat_ids[ids >= 0]] = True
+            any_member = torch.zeros(n_table + 1, dtype=torch.bool, device=q.device)
+            any_member.scatter_(0, cand_flat.flatten(), True)
+            any_member = any_member[:n_table]
         else:
             any_member = member.any(dim=0)  # [n_slots * n_local_blocks]
-        live_keys = any_member[slot_of_key]  # [keys]
+        # Parked tail keys share slot 0 with real keys but can never be selected.
+        live_keys = any_member[slot_of_key] & key_assigned  # [keys]
         n_tiles = -(-keys // dense_key_chunk)
         pad = n_tiles * dense_key_chunk - keys
         causal_live = torch.arange(keys, device=q.device) < causal_key_limit
         live_mask = causal_live if want_block_scores else causal_live & live_keys
         live_padded = F.pad(live_mask, (0, pad), value=False)
         tile_liveness = live_padded.view(-1, dense_key_chunk).any(dim=-1)
-        tile_ids = tile_liveness.nonzero().flatten()
+        # Read the live tile ids to the host once; indexing the device tensor per element
+        # synchronised for every tile.
+        tile_ids = tile_liveness.nonzero().flatten().tolist()
         # `tile_ids` holds one entry per LIVE tile, which is fewer than
         # `n_tiles` whenever any tile is dead -- the normal case, since the
         # causal skip alone kills the padding tail. Iterate its own length.
-        n_live = tile_ids.numel()
+        n_live = len(tile_ids)
         stage_bounds = []
         i = 0
         while i < n_live:
             j = i
-            while j + 1 < n_live and int(tile_ids[j + 1]) == int(tile_ids[j]) + 1:
+            while j + 1 < n_live and tile_ids[j + 1] == tile_ids[j] + 1:
                 j += 1
             stage_bounds.append(
-                (
-                    int(tile_ids[i]) * dense_key_chunk,
-                    min(keys, (int(tile_ids[j]) + 1) * dense_key_chunk),
-                )
+                (tile_ids[i] * dense_key_chunk, min(keys, (tile_ids[j] + 1) * dense_key_chunk))
             )
             i = j + 1
         if not stage_bounds:
@@ -467,6 +495,24 @@ def _streaming_indexer_topk(
             stage_bounds = [(0, 0)]
     elif causal_key_limit < keys:
         stage_bounds = [(0, causal_key_limit)]
+    # The streamed paths visit the C-block buckets their keys fall in. Read each key's bucket
+    # to the host once per call, so the stages pick their buckets there instead of reading the
+    # device for a unique() per stage and a nonzero() per bucket. Invalid keys get -1: they
+    # are never causally visible, so neither their membership nor their block maxima matter.
+    key_buckets = key_buckets_host = None
+    if compact_member or rolling_blocks is not None:
+        key_buckets = torch.where(
+            compressed_layout.valid_groups[: slot_of_key.numel()],
+            slot_of_key // _CANDIDATE_BLOCK_CHUNK_SIZE,
+            -1,
+        )
+        key_buckets_host = key_buckets.cpu()
+
+    def stage_buckets(start, end):
+        """Ascending buckets of the stage's valid keys, from the host copy."""
+        buckets = key_buckets_host[start:end]
+        return torch.unique(buckets[buckets >= 0]).tolist()
+
     for bounds in (stage_bounds if stage_bounds is not None else [(0, keys)]):
         stage_lo0, stage_stop = bounds
         for stage_start in range(stage_lo0, stage_stop, stage):
@@ -479,33 +525,12 @@ def _streaming_indexer_topk(
             chunk = torch.empty(b, s, width, device=q.device, dtype=torch.float32)
             for start in range(stage_start, stage_end, dense_key_chunk):
                 end = min(start + dense_key_chunk, stage_end)
-                import os as _or
-
-                if _or.environ.get("RNG_DEBUG", "0") == "1":
-                    print("[rng]", start, end, indexer_k.shape[0], flush=True)
                 _ik_n = int(indexer_k.shape[0])
                 if start >= _ik_n:
-                    # 压缩布局比 indexer_k 多出的尾部（4,096 行）没有对应 KV；
-                    # 这些位置 keep_causal 本来就是无效的，直接跳过该 stage。
+                    # The compressed layout can extend past indexer_k (a trailing tail with
+                    # no KV); keep_causal is already false there, so skip the tile.
                     continue
                 end = min(end, _ik_n)
-                import os as _o3
-
-                if _o3.environ.get("SH3", "0") == "1" and (
-                    indexer_k[start:end].shape[0] == 0 or q.shape[2] == 0
-                ):
-                    print(
-                        "[sh3] ik_slice=%s q=%s hw=%s start=%s end=%s ik_len=%s"
-                        % (
-                            tuple(indexer_k[start:end].shape),
-                            tuple(q.shape),
-                            tuple(head_weights.shape),
-                            start,
-                            end,
-                            indexer_k.shape[0],
-                        ),
-                        flush=True,
-                    )
                 c = torch.einsum("sbhd,tbd->bsht", q, indexer_k[start:end]).relu()
                 chunk[..., start - stage_start : end - stage_start] = (c * head_weights).sum(dim=2)
             keep_causal = (
@@ -520,20 +545,20 @@ def _streaming_indexer_topk(
             if compact_member:
                 member_of_chunk = torch.zeros((s, width), dtype=torch.bool, device=q.device)
                 stage_slots = slot_of_key[stage_start:stage_end]
-                for bucket in torch.unique(stage_slots // _CANDIDATE_BLOCK_CHUNK_SIZE).tolist():
+                stage_key_buckets = key_buckets[stage_start:stage_end]
+                for bucket in stage_buckets(stage_start, stage_end):
                     lo = bucket * _CANDIDATE_BLOCK_CHUNK_SIZE
-                    bucket_width = min(_CANDIDATE_BLOCK_CHUNK_SIZE, n_slots * n_local_blocks - lo)
-                    flags = torch.zeros((s, bucket_width), dtype=torch.bool, device=q.device)
-                    ids = candidates.indices
-                    flat_ids = rows_seq.clamp_min(0)[:, None] * n_local_blocks + ids.long()
-                    valid = (ids >= 0) & (flat_ids >= lo) & (flat_ids < lo + bucket_width)
-                    flags[row_ids[:, None].expand_as(ids)[valid], flat_ids[valid] - lo] = True
-                    columns = (
-                        ((stage_slots >= lo) & (stage_slots < lo + bucket_width))
-                        .nonzero()
-                        .flatten()
+                    bucket_width = min(_CANDIDATE_BLOCK_CHUNK_SIZE, n_table - lo)
+                    # Column `bucket_width` takes the candidates outside this bucket and is
+                    # cleared, so the stage's keys outside it read False from there.
+                    flags = torch.zeros((s, bucket_width + 1), dtype=torch.bool, device=q.device)
+                    in_bucket = (cand_flat >= lo) & (cand_flat < lo + bucket_width)
+                    flags.scatter_(1, torch.where(in_bucket, cand_flat - lo, bucket_width), True)
+                    flags[:, bucket_width] = False
+                    columns = torch.where(
+                        stage_key_buckets == bucket, stage_slots - lo, bucket_width
                     )
-                    member_of_chunk[:, columns] = flags[:, stage_slots[columns] - lo]
+                    member_of_chunk |= flags.gather(1, columns[None, :].expand(s, width))
                     del flags
             elif member is not None:
                 if slot_of_key is not None:
@@ -571,31 +596,37 @@ def _streaming_indexer_topk(
                 # Valid packed keys advance monotonically in flattened slots;
                 # orphan padding may reset to zero and is excluded here.
                 stage_slots = slot_of_key[stage_start:stage_end]
-                valid_keys = compressed_layout.valid_groups[stage_start:stage_end]
-                for bucket in torch.unique(
-                    stage_slots[valid_keys] // _CANDIDATE_BLOCK_CHUNK_SIZE
-                ).tolist():
+                stage_key_buckets = key_buckets[stage_start:stage_end]
+                for bucket in stage_buckets(stage_start, stage_end):
+                    if block_bucket is not None and bucket < block_bucket:
+                        # A finished bucket is already merged into the rolling top-k; folding
+                        # it again would insert a second partial maximum for the same block.
+                        raise RuntimeError(
+                            f"CSA2 rolling block fold revisited bucket {bucket} after "
+                            f"{block_bucket}; valid keys must advance monotonically in slots"
+                        )
                     if block_bucket != bucket:
                         finish_block_bucket()
                         del local_block_table
                         block_bucket = bucket
                         lo = bucket * _CANDIDATE_BLOCK_CHUNK_SIZE
+                        local_block_width = min(_CANDIDATE_BLOCK_CHUNK_SIZE, n_table - lo)
+                        # The spare last column takes the stage's keys outside this bucket;
+                        # finish_block_bucket() never reads it.
                         local_block_table = torch.full(
-                            (s, min(_CANDIDATE_BLOCK_CHUNK_SIZE, n_slots * n_local_blocks - lo)),
+                            (s, local_block_width + 1),
                             -torch.inf,
                             device=q.device,
                             dtype=torch.float32,
                         )
                     lo = bucket * _CANDIDATE_BLOCK_CHUNK_SIZE
-                    columns = (
-                        (valid_keys & (stage_slots // _CANDIDATE_BLOCK_CHUNK_SIZE == bucket))
-                        .nonzero()
-                        .flatten()
+                    columns = torch.where(
+                        stage_key_buckets == bucket, stage_slots - lo, local_block_width
                     )
                     local_block_table.scatter_reduce_(
                         1,
-                        (stage_slots[columns] - lo)[None, :].expand(s, columns.numel()),
-                        chunk_causal[0, :, columns],
+                        columns[None, :].expand(s, width),
+                        chunk_causal[0],
                         reduce="amax",
                         include_self=True,
                     )
@@ -1019,12 +1050,9 @@ class CSA2Indexer(MegatronModule):
             raise ValueError("Provide either latent or indexer_k, not both.")
         q, weights = self._indexer_q_weights(x, qr, rotary_pos_emb, thd_layout)
         if torch.is_grad_enabled():
-            # Keep the operands in their native dtype so the einsum runs on tensor cores
-            # (fp32 accumulate) instead of SIMT. Upcasting both operands to fp32 forced an
-            # sm80_xmma_gemm_f32f32_f32f32 kernel that cannot use tensor cores; the chunked
-            # inference path below already uses the native dtype. Only the reduced scores are
-            # promoted, which is where the head-weight mix needs the extra range.
-            scores = torch.einsum("sbhd,tbd->bsht", q, indexer_k).relu().float()
+            # Score in FP32: with BF16 operands the einsum also returns BF16, rounding every
+            # per-head score that top-k selection and the indexer loss read.
+            scores = torch.einsum("sbhd,tbd->bsht", q.float(), indexer_k.float()).relu()
             scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
         else:
             scores = _chunked_csa2_indexer_scores(q, indexer_k, weights)
@@ -1125,8 +1153,7 @@ class CSA2Indexer(MegatronModule):
             winners = block.argsort(dim=-1, descending=True, stable=True)[..., :topk]
             parts.append(winners.sort(dim=-1).values)
         indices = torch.cat(parts, dim=0).reshape(*scores.shape[:-1], topk)
-        out = indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
-        return out
+        return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
 
     @torch.no_grad()
     def forward(
@@ -1329,33 +1356,9 @@ class CompressedSparseAttention2(MegatronModule):
                 )
             )
             if cp_layout is not None:
-                if __import__("os").environ.get("DSV41_CP_TRACE", "0") == "1":
-                    import torch as _t
-                    import torch.distributed as _d
-
-                    _mode = "grad" if _t.is_grad_enabled() else "nograd"
-                    print(
-                        f"[cptrace] rank={_d.get_rank()} layer={getattr(self, 'layer_idx', -1)} "
-                        f"mode={_mode}",
-                        flush=True,
-                    )
-                _gt = __import__("os").environ.get("DSV41_GATHER_TIMING", "0") == "1"
-                if _gt:
-                    import time as _time
-
-                    import torch as _torch
-
-                    _n_k = state.indexer_k.numel() * state.indexer_k.element_size()
-                    _n_v = state.global_kv.numel() * state.global_kv.element_size()
-                    _c = self.cp_group.size()
-                    _torch.cuda.synchronize()
-                    _t0 = _time.perf_counter()
-                _ik_g = gather_from_sequence_parallel_region(state.indexer_k, group=self.cp_group)
-                _ik_m = cp_layout.to_sequence_major(_ik_g)
-                state.indexer_k = _ik_m
-                if _gt:
-                    _torch.cuda.synchronize()
-                    _t1 = _time.perf_counter()
+                state.indexer_k = cp_layout.to_sequence_major(
+                    gather_from_sequence_parallel_region(state.indexer_k, group=self.cp_group)
+                )
                 state.global_kv = cp_layout.to_sequence_major(
                     gather_from_sequence_parallel_region(state.global_kv, group=self.cp_group)
                 )
@@ -1366,9 +1369,8 @@ class CompressedSparseAttention2(MegatronModule):
                 # passes read it as a leaf and inject the adjoint the later passes
                 # accumulated, so the owning projection is credited exactly once.
                 _tape = getattr(state, "chunk_tape", None)
-
-                # 只有 KV source 层发布 source slot；Reindex/Reuse 消费者跳过，
-                # 否则会把 Full 层留下的扩展值再扩展一次（122880→245760→491520）。
+                # Only KV-source layers publish a source slot. Reindex/Reuse consumers skip
+                # it; extending again would grow the Full layer's cumulative buffer twice.
                 if _tape is not None and self.is_kv_source:
                     pass_begin = thd_layout.chunk_index * thd_layout.global_total_tokens
                     prefix_mask = cp_layout.global_layout.source_indices[:, -1] < pass_begin
@@ -1377,15 +1379,6 @@ class CompressedSparseAttention2(MegatronModule):
                     )
                     state.global_kv = extend_chunk_kv(
                         _tape, self.layer_idx, "global_kv", state.global_kv, prefix_mask
-                    )
-                if _gt:
-                    _torch.cuda.synchronize()
-                    _t2 = _time.perf_counter()
-                    print(
-                        f"[gather] layer={self.layer_idx} cp={_c} "
-                        f"indexer_k={_n_k/1e6:.1f}MB kv={_n_v/1e6:.1f}MB "
-                        f"t_indexer={( _t1-_t0)*1000:.2f}ms t_kv={(_t2-_t1)*1000:.2f}ms",
-                        flush=True,
                     )
             state.kv_source_layer = self.layer_idx
             state.global_indices = state.candidates = None
@@ -1725,9 +1718,9 @@ class CompressedSparseAttention2(MegatronModule):
                 csa2_state.thd_layout = thd_layout
             else:
                 csa2_state.thd_layout.validate_layout(thd_layout)
-        # Outer-sequence chunking: 每次都同步 tape，不依赖 state 是否新建。
-        # 原来的赋值在 `if csa2_state is None:` 里，而复用的 state 永远不会被设置，
-        # 导致 extend_chunk_kv 被跳过、后续 pass 看不到前文。
+        # Outer-sequence chunking: attach the tape whether or not the state is new. Setting it
+        # only for a fresh state skipped extend_chunk_kv on reused states, so later passes
+        # lost their prefix.
         if thd_layout is not None and getattr(csa2_state, "chunk_tape", None) is None:
             csa2_state.chunk_tape = getattr(thd_layout, "chunk_tape", None)
         csa2_state.validate_forward(self.layer_idx, query)
