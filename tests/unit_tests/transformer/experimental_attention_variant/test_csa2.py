@@ -590,10 +590,15 @@ def test_fp8_fake_quant_explicit_off_preserves_default_tensor_identity():
 
 
 def test_fp8_fake_quant_switch_requires_boolean():
-    """CSA2 config validation rejects non-boolean activation quantization flags."""
-    config = _make_config(csa2_fp8_output_act=1)
+    """CSA2 config validation rejects non-boolean activation quantization flags.
+
+    Construction runs validate_csa2_config() through MLATransformerConfig.__post_init__,
+    so the refusal happens inside ``_make_config`` and the assertion has to wrap the
+    constructor: a config carrying a non-boolean flag must not be obtainable at all,
+    which is exactly what production relies on.
+    """
     with pytest.raises(ValueError, match="csa2_fp8_output_act must be a boolean"):
-        validate_csa2_config(config)
+        _make_config(csa2_fp8_output_act=1)
 
 
 def test_fp8_fake_quant_has_straight_through_gradient():
