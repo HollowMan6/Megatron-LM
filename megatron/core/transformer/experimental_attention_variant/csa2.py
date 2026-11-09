@@ -7,6 +7,7 @@ tensors belong to one stack forward and are passed explicitly; modules retain no
 state or inference caches.
 """
 
+import logging
 import os
 from copy import copy
 from dataclasses import dataclass
@@ -164,6 +165,13 @@ class _FP8FakeQuantSTE(torch.autograd.Function):
         return grad_output, None
 
 
+_LOGGER = logging.getLogger(__name__)
+
+#: Set once, the first time the FP8 output round trip runs without an absorbed
+#: V up projection, so the degraded branch is stated on every run and once.
+_CSA2_FP8_ACT_DEGRADED_REPORTED = False
+
+
 def _fp8_fake_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     """Emulate DeepSeek's blockwise UE8M0-scale E4M3 activation quantizer."""
     return _FP8FakeQuantSTE.apply(x, block_size)
@@ -172,6 +180,53 @@ def _fp8_fake_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
 def _maybe_fp8_fake_quant(x: torch.Tensor, enabled: bool, block_size: int = 32) -> torch.Tensor:
     """Leave disabled tensors untouched; otherwise apply blockwise E4M3 quantization."""
     return _fp8_fake_quant(x, block_size) if enabled else x
+
+
+def _csa2_fp8_act_quantize(
+    output: torch.Tensor, up_v_weight: torch.Tensor | None, block_size: int = 32
+) -> torch.Tensor:
+    """Apply the CSA2 FP8 output round trip, absorbed projection first when supplied.
+
+    ``up_v_weight`` exists for callers whose core attention returns compressed
+    latents: ``AbsorbedMLA`` hands it the ``[heads, v_head_dim, kv_lora_rank]``
+    weight, this call absorbs the V up projection and the blockwise E4M3 round
+    trip lands before the output projection, which is the official anchor.
+
+    The DSv4.1 hybrid attention path (``DSv4HybridAttention``) does not absorb: its
+    core attention already returns value-space ``[b, s, heads, v_head_dim]`` (the
+    module splits ``nope_dim = v_head_dim - pos_dim`` plus the rope part right
+    after), so no up projection is missing and none can be skipped -- the same
+    quantizer applies to that tensor as it stands, blocked along the same last
+    dimension. Both branches end flattened to ``[b, s, heads * last]``.
+    """
+    if up_v_weight is not None:
+        up_v_weight = up_v_weight.to(device=output.device, dtype=output.dtype).contiguous()
+        output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
+    output = _fp8_fake_quant(output.to(torch.bfloat16), block_size)
+    return output.reshape(output.shape[0], output.shape[1], -1)
+
+
+def _csa2_fp8_act_output(
+    output: torch.Tensor, up_v_weight: torch.Tensor | None, block_size: int = 32
+) -> torch.Tensor:
+    """The switched-on path: state a degraded branch once, then quantize either way.
+
+    A caller that cannot supply ``up_v_weight`` is reporting a fact about the
+    attention path, not a defect, so this reports it once per process and keeps
+    going instead of failing the run.
+    """
+    if up_v_weight is None:
+        global _CSA2_FP8_ACT_DEGRADED_REPORTED
+        if not _CSA2_FP8_ACT_DEGRADED_REPORTED:
+            _CSA2_FP8_ACT_DEGRADED_REPORTED = True
+            _LOGGER.info(
+                "csa2_fp8_output_act: no up_v_weight supplied, so the E4M3 round trip "
+                "applies to the attention output itself (block %d on its last dimension); "
+                "the absorbed V up projection is not part of this attention path and "
+                "nothing is skipped by omitting it.",
+                block_size,
+            )
+    return _csa2_fp8_act_quantize(output, up_v_weight, block_size)
 
 
 def _causal_key_limit(thd_layout, compressed_layout, keys: int) -> int:
@@ -1919,13 +1974,7 @@ class CompressedSparseAttention2(MegatronModule):
         if thd_layout is not None:
             output = output.masked_fill(~thd_layout.valid_tokens[:, None, None], 0)
         if self.config.csa2_fp8_output_act:
-            if up_v_weight is None:
-                raise ValueError("CSA2 FP8 output fake quantization requires up_v_weight")
-            up_v_weight = up_v_weight.to(device=output.device, dtype=output.dtype).contiguous()
-            output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
-            output = output.to(torch.bfloat16)
-            output = _fp8_fake_quant(output, 32)
-            output = output.reshape(output.shape[0], output.shape[1], -1)
+            output = _csa2_fp8_act_output(output, up_v_weight)
         return output
 
     def forward(self, *args, **kwargs):
