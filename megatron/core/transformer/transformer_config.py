@@ -440,6 +440,9 @@ class TransformerConfig(ModelParallelConfig):
     csa2_fp4_indexer_qk: bool = False
     """Apply E2M1 fake quantization to post-RoPE indexer queries and keys."""
 
+    csa2_fp8_output_act: bool = False
+    """Apply UE8M0/E4M3 fake quantization to CSA2 output before linear_proj."""
+
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 

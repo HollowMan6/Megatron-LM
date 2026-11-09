@@ -135,6 +135,62 @@ def _check_fp4_cpu_workspace(quantize=None):
         (quantize or _fp4_fake_quant)(values, 32)
 
 
+def _fp8_reference(x, block_size=32):
+    """Independent blockwise UE8M0/E4M3 reference for the DeepSeek activation path."""
+    width = x.shape[-1]
+    pad = (-width) % block_size
+    values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
+    amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    encoded = (values / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return (encoded.float() * scale).reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
+
+
+def _check_fp8_cpu_case(values, block_size=32):
+    before = values.clone()
+    expected = _fp8_reference(values, block_size)
+    actual = _fp8_fake_quant(values, block_size)
+    assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
+    assert actual.shape == values.shape and actual.dtype == values.dtype
+    assert torch.equal(values, before)
+
+
+def _check_fp8_cpu_workspace(quantize=None):
+    """The quantizer must not create grid-expanded intermediates."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    values = torch.randn(2, 64, dtype=torch.bfloat16)
+
+    class InputSizedWorkspace(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            for tensor in tree_leaves(result):
+                if isinstance(tensor, torch.Tensor):
+                    assert tensor.numel() <= values.numel(), (func, tensor.shape)
+            return result
+
+    with InputSizedWorkspace():
+        (quantize or _fp8_fake_quant)(values, 32)
+
+
+def _load_fp8_cpu_definitions():
+    """Execute the actual FP8 quantizer AST without GPU-only Megatron imports."""
+    import ast
+
+    source = Path(__file__).resolve().parents[4] / "megatron/core/transformer"
+    source = source / "experimental_attention_variant/csa2.py"
+    tree = ast.parse(source.read_text())
+    names = {"_FP8FakeQuantSTE", "_fp8_fake_quant", "_maybe_fp8_fake_quant"}
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
+    ]
+    assert {node.name for node in nodes} == names
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), globals())
+
+
 def _load_fp4_cpu_definitions():
     """Execute the actual quantizer AST without importing GPU-only Megatron modules."""
     import ast
@@ -200,7 +256,50 @@ def _fp4_cpu_main():
             )
         )
         return
+    _load_fp8_cpu_definitions()
     passed = failed = 0
+    for dtype in (torch.float32, torch.bfloat16):
+        generator = torch.Generator().manual_seed(541)
+        cases = [
+            torch.zeros(3, 64),
+            torch.tensor([[1e-6] + [0.0] * 63]),
+            torch.tensor([[448.0, -448.0] + [0.0] * 62]),
+            torch.tensor([[448.0] + [0.0] * 31 + [1.0] + [0.0] * 31]),
+            torch.tensor([[1.0, 0.0] + [0.0] * 62]),
+            torch.tensor([[448.01, -448.01] + [448.0] * 30 + [896.0, -896.0] + [0.0] * 30]),
+            torch.randn(3, 96, generator=generator) * 1000,
+            torch.randn(3, 64, 2, generator=generator)[..., 0],
+        ]
+        for case_idx, values in enumerate(cases):
+            try:
+                _check_fp8_cpu_case(values.to(dtype))
+            except AssertionError:
+                print(f"FAIL FP8 {dtype} case={case_idx}")
+                failed += 1
+            else:
+                print(f"PASS FP8 {dtype} case={case_idx}")
+                passed += 1
+        try:
+            values = torch.linspace(-500, 500, 64, dtype=dtype, requires_grad=True)
+            gradient = torch.linspace(-2, 3, 64, dtype=dtype)
+            _fp8_fake_quant(values).backward(gradient)
+            assert torch.equal(values.grad, gradient)
+            disabled = _maybe_fp8_fake_quant(values, False)
+            assert disabled is values and disabled.data_ptr() == values.data_ptr()
+        except AssertionError:
+            print(f"FAIL FP8 {dtype} STE/disabled identity")
+            failed += 1
+        else:
+            print(f"PASS FP8 {dtype} STE/disabled identity")
+            passed += 1
+    try:
+        _check_fp8_cpu_workspace()
+    except AssertionError:
+        print("FAIL FP8 input-sized workspace")
+        failed += 1
+    else:
+        print("PASS FP8 input-sized workspace")
+        passed += 1
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
         for block_size in (16, 32):
             cases = _fp4_cpu_cases(block_size, dtype)
@@ -286,7 +385,9 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2Indexer,
     CSA2IndexerSubmodules,
     CSA2State,
+    _fp8_fake_quant,
     _fp4_fake_quant,
+    _maybe_fp8_fake_quant,
     _maybe_fp4_fake_quant,
     select_candidate_blocks,
 )
@@ -373,6 +474,69 @@ def test_fp4_fake_quant_disabled_path_is_bitwise_baseline():
     )
     assert torch.equal(after_change, baseline)
     assert after_change.data_ptr() == baseline.data_ptr()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fp8_fake_quant_matches_independent_reference(dtype):
+    """Power-of-two scales and E4M3 round-trip match an independent implementation."""
+    generator = torch.Generator().manual_seed(541)
+    cases = [
+        torch.zeros(3, 64),
+        torch.tensor([[448.0, -448.0] + [0.0] * 62]),
+        torch.tensor([[1.0, 0.0] + [0.0] * 62]),
+        torch.tensor([[448.01, -448.01] + [448.0] * 30 + [896.0, -896.0] + [0.0] * 30]),
+        torch.randn(3, 96, generator=generator) * 1000,
+        torch.randn(3, 64, 2, generator=generator)[..., 0],
+    ]
+    for values in cases:
+        _check_fp8_cpu_case(values.to(dtype))
+
+
+def test_fp8_fake_quant_uses_floor_power_and_independent_32_wide_blocks():
+    """A zero block uses the 1e-4 floor and adjacent blocks choose independent scales."""
+    values = torch.zeros(1, 64, dtype=torch.float32)
+    values[0, 32:] = 1.0
+    quantized = _fp8_fake_quant(values)
+    expected = _fp8_reference(values)
+    assert torch.equal(quantized, expected)
+    assert torch.equal(quantized[0, :32], torch.zeros(32))
+    assert torch.equal(quantized[0, 32:], torch.ones(32))
+    boundary = torch.zeros(1, 32)
+    boundary[0, 0] = torch.nextafter(torch.tensor(448.0), torch.tensor(float("inf")))
+    assert torch.equal(_fp8_fake_quant(boundary), _fp8_reference(boundary))
+    heads = torch.zeros(1, 1, 2, 16)
+    heads[0, 0, 0, 0] = 1.0
+    heads[0, 0, 1, 0] = 448.0
+    assert torch.equal(_fp8_fake_quant(heads), _fp8_reference(heads))
+
+
+def test_fp8_fake_quant_disabled_path_preserves_default_tensor_identity():
+    """The default-off feature is a literal no-op, including no allocation."""
+    config = _make_config()
+    assert config.csa2_fp8_output_act is False
+    values = torch.randn(3, 64, dtype=torch.bfloat16)
+    result = _maybe_fp8_fake_quant(values, config.csa2_fp8_output_act)
+    assert result is values and result.data_ptr() == values.data_ptr()
+
+
+def test_fp8_fake_quant_switch_requires_boolean():
+    """CSA2 config validation rejects non-boolean activation quantization flags."""
+    config = _make_config(csa2_fp8_output_act=1)
+    with pytest.raises(ValueError, match="csa2_fp8_output_act must be a boolean"):
+        validate_csa2_config(config)
+
+
+def test_fp8_fake_quant_has_straight_through_gradient():
+    """The fake quantizer changes forward values and passes gradients unchanged."""
+    values = torch.linspace(-500, 500, 64, requires_grad=True)
+    gradient = torch.linspace(-2, 3, 64)
+    _fp8_fake_quant(values).backward(gradient)
+    assert torch.equal(values.grad, gradient)
+
+
+def test_fp8_fake_quant_cpu_workspace():
+    """The implementation keeps every temporary no larger than its input."""
+    _check_fp8_cpu_workspace()
 
 
 @pytest.mark.parametrize(

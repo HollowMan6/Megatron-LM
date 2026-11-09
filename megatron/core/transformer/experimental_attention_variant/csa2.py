@@ -145,6 +145,35 @@ def _maybe_fp4_fake_quant(x: torch.Tensor, enabled: bool, block_size: int) -> to
     return _fp4_fake_quant(x, block_size) if enabled else x
 
 
+class _FP8FakeQuantSTE(torch.autograd.Function):
+    """Return blockwise UE8M0/E4M3 values and pass gradients through unchanged."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        width = x.shape[-1]
+        pad = (-width) % block_size
+        values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
+        amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+        scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+        normalized = (values / scale).clamp_(-448.0, 448.0)
+        rounded = normalized.to(torch.float8_e4m3fn).float().mul_(scale)
+        return rounded.reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+def _fp8_fake_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Emulate DeepSeek's blockwise UE8M0-scale E4M3 activation quantizer."""
+    return _FP8FakeQuantSTE.apply(x, block_size)
+
+
+def _maybe_fp8_fake_quant(x: torch.Tensor, enabled: bool, block_size: int = 32) -> torch.Tensor:
+    """Leave disabled tensors untouched; otherwise apply blockwise E4M3 quantization."""
+    return _fp8_fake_quant(x, block_size) if enabled else x
+
+
 def _causal_key_limit(thd_layout, compressed_layout, keys: int) -> int:
     """Return the causal key limit for these layouts, computing it once per layout pair."""
     key = (id(thd_layout), id(compressed_layout), keys)
@@ -1318,6 +1347,7 @@ class CompressedSparseAttention2(MegatronModule):
             and layer_idx > config.csa2_candidate_source_layer
         )
         self.compress_ratio = ratio
+        self.consumes_absorbed_v_up_projection = bool(config.csa2_fp8_output_act)
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
@@ -1725,6 +1755,7 @@ class CompressedSparseAttention2(MegatronModule):
         boundary_hidden: torch.Tensor | None = None,
         boundary_kv: torch.Tensor | None = None,
         csa2_state: CSA2State | None = None,
+        up_v_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend jointly to causal window and selected global latents using one softmax."""
         cp_size = get_pg_size(self.cp_group)
@@ -1887,6 +1918,14 @@ class CompressedSparseAttention2(MegatronModule):
         csa2_state.last_layer = self.layer_idx
         if thd_layout is not None:
             output = output.masked_fill(~thd_layout.valid_tokens[:, None, None], 0)
+        if self.config.csa2_fp8_output_act:
+            if up_v_weight is None:
+                raise ValueError("CSA2 FP8 output fake quantization requires up_v_weight")
+            up_v_weight = up_v_weight.to(device=output.device, dtype=output.dtype).contiguous()
+            output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
+            output = output.to(torch.bfloat16)
+            output = _fp8_fake_quant(output, 32)
+            output = output.reshape(output.shape[0], output.shape[1], -1)
         return output
 
     def forward(self, *args, **kwargs):

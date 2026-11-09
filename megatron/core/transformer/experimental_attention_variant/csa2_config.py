@@ -36,7 +36,7 @@ def _validate_tilelang_backend_dependencies() -> None:
 
 def validate_csa2_config(config) -> None:
     """Reject inconsistent owners, compression ratios and hierarchical candidate pools."""
-    for name in ("csa2_fp4_compressed_kv", "csa2_fp4_indexer_qk"):
+    for name in ("csa2_fp4_compressed_kv", "csa2_fp4_indexer_qk", "csa2_fp8_output_act"):
         if type(getattr(config, name)) is not bool:
             raise ValueError(f"{name} must be a boolean")
     if not config.multi_latent_attention or not config.qk_layernorm:
