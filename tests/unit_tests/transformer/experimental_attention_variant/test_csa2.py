@@ -823,6 +823,25 @@ def pg_collection():
     Utils.destroy_model_parallel()
 
 
+def _unquantized(**overrides):
+    """Config for a module that is compared against the dense reference below.
+
+    The three fake-quant sites are ON by default on this fork, and the reference
+    implementations in this file (``_reference``, ``_reference_layer``,
+    ``_reference_scores``) do not quantize. Every module-level test therefore has
+    to state the sites off explicitly instead of inheriting the default -- these
+    tests measure the attention mechanism, not the quantizer, whose own behaviour
+    is pinned by ``test_csa2_fp8_output_act.py`` and by the FP4/FP8 cases in this
+    file that call ``_fp4_fake_quant`` / ``_fp8_fake_quant`` directly.
+    """
+    return _make_config(
+        csa2_fp4_compressed_kv=False,
+        csa2_fp4_indexer_qk=False,
+        csa2_fp8_output_act=False,
+        **overrides,
+    )
+
+
 def _layer(pg_collection, ratio, dtype=torch.float32, **overrides):
     config_values = dict(
         num_layers=1,
@@ -835,7 +854,7 @@ def _layer(pg_collection, ratio, dtype=torch.float32, **overrides):
         dsa_indexer_topk=2,
     )
     config_values.update(overrides)
-    config = _make_config(params_dtype=dtype, **config_values)
+    config = _unquantized(params_dtype=dtype, **config_values)
     layer = build_module(
         _attention_spec(dtype), config=config, layer_number=1, pg_collection=pg_collection
     ).cuda()
@@ -1403,7 +1422,7 @@ def test_bf16_conversion_keeps_compressor_and_sink_in_fp32(pg_collection):
 
 @pytest.mark.parametrize("layer_number", [3, 5, 6])
 def test_cross_layer_modes_require_forward_state(pg_collection, layer_number):
-    config = _make_config()
+    config = _unquantized()
     layer = build_module(
         csa2_attention_spec, config=config, layer_number=layer_number, pg_collection=pg_collection
     ).cuda()
@@ -1413,7 +1432,7 @@ def test_cross_layer_modes_require_forward_state(pg_collection, layer_number):
 
 
 def test_candidate_source_can_run_standalone(pg_collection):
-    config = _make_config()
+    config = _unquantized()
     layer = build_module(
         csa2_attention_spec, config=config, layer_number=4, pg_collection=pg_collection
     ).cuda()
@@ -1446,20 +1465,7 @@ def _layers(pg_collection, dtype=torch.float32, candidates=True):
             csa2_candidate_block_size=0,
         )
     )
-    # The fake-quant sites are switched OFF for every module-level test in this file:
-    # they compare the module against the hand-written dense reference above, which
-    # does not quantize, so leaving the fork's new on-by-default flags in place would
-    # compare two different computations. The quantizers themselves are covered by
-    # test_csa2_fp8_output_act.py and by the FP4/FP8 cases below, which call them
-    # directly; nothing here depends on the default value either way.
-    config = _make_config(
-        params_dtype=dtype,
-        dsa_indexer_topk=2,
-        csa2_fp4_compressed_kv=False,
-        csa2_fp4_indexer_qk=False,
-        csa2_fp8_output_act=False,
-        **overrides,
-    )
+    config = _unquantized(params_dtype=dtype, dsa_indexer_topk=2, **overrides)
     spec = _attention_spec(dtype)
     layers = torch.nn.ModuleList(
         build_module(spec, config=config, layer_number=i + 1, pg_collection=pg_collection)
@@ -2933,7 +2939,9 @@ class _CPURotaryTable(nn.Module):
 
 
 def _sharing_cores(per_token=False, reuse=False):
-    config = _make_config(
+    # Same rule as _layer/_layers: these cores are compared against each other and
+    # against the sharing reference, so the quantized path is not what they test.
+    config = _unquantized(
         num_layers=4 if reuse else 3,
         csa_compress_ratios=[1] * (4 if reuse else 3),
         csa2_kv_source_layers=[0],
