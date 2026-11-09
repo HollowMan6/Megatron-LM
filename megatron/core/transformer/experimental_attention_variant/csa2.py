@@ -120,17 +120,14 @@ class _FP4FakeQuantSTE(torch.autograd.Function):
         values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
         amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * 2.0**-126)
         scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
-        normalized = (values / scale).clamp(-6.0, 6.0).abs()
-        grid = torch.tensor(_FP4_E2M1_GRID, device=x.device, dtype=torch.float32)
-        distances = (normalized.unsqueeze(-1) - grid).abs()
-        minimum = distances.amin(dim=-1, keepdim=True)
-        tied = distances == minimum
-        even_indices = torch.arange(8, device=x.device)
-        even = even_indices.remainder(2) == 0
-        even_tie = torch.where(tied & even, even_indices, 8).amin(dim=-1).clamp_max(7)
-        nearest = distances.argmin(dim=-1)
-        indices = torch.where(tied.sum(dim=-1).squeeze(-1) > 1, even_tie, nearest)
-        rounded = grid[indices] * values.sign() * scale
+        normalized = (values / scale).clamp_(-6.0, 6.0).abs_()
+        # E2M1 has uniform spacing within [0, 2), [2, 4), and [4, 6].
+        # Each interval starts at an even grid index, so round-to-even on the
+        # local lattice also resolves midpoint ties to the even E2M1 index.
+        # Keep only input-shaped temporaries instead of eight distances per value.
+        step = torch.where(normalized < 2.0, 0.5, torch.where(normalized < 4.0, 1.0, 2.0))
+        normalized.div_(step).round_().mul_(step)
+        rounded = normalized.mul_(values.sign()).mul_(scale)
         return rounded.reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
 
     @staticmethod

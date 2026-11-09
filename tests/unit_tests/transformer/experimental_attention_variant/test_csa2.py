@@ -3,6 +3,9 @@
 """CSA2 dense-oracle and shared-gradient tests, adapted from NVIDIA/Megatron-LM#7224.
 Original implementation and oracles by Hongxiao Bai. The oracle follows DeepSeek's
 published inference implementation and does not call the CSA2 attention operators.
+
+Run this file directly with Python for CPU-only FP4 checks (no Megatron imports);
+add --benchmark for isolated old/new timing and peak RSS measurements.
 """
 
 import math
@@ -11,6 +14,255 @@ from contextlib import nullcontext
 from copy import copy
 from pathlib import Path
 from types import SimpleNamespace
+
+
+def _fp4_grid_search_reference(x, block_size):
+    """Frozen pre-vectorization implementation, including its FP32 distance arithmetic."""
+    width = x.shape[-1]
+    pad = (-width) % block_size
+    values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
+    amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * 2.0**-126)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
+    normalized = (values / scale).clamp(-6.0, 6.0).abs()
+    grid = torch.tensor((0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), dtype=torch.float32)
+    distances = (normalized.unsqueeze(-1) - grid).abs()
+    minimum = distances.amin(dim=-1, keepdim=True)
+    tied = distances == minimum
+    even_indices = torch.arange(8)
+    even = even_indices.remainder(2) == 0
+    even_tie = torch.where(tied & even, even_indices, 8).amin(dim=-1).clamp_max(7)
+    nearest = distances.argmin(dim=-1)
+    indices = torch.where(tied.sum(dim=-1).squeeze(-1) > 1, even_tie, nearest)
+    rounded = grid[indices] * values.sign() * scale
+    return rounded.reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
+
+
+def _fp4_cpu_cases(block_size, dtype):
+    generator = torch.Generator().manual_seed(429)
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    midpoints = (grid[:-1] + grid[1:]) / 2
+    neighbors = torch.cat(
+        (
+            midpoints,
+            torch.nextafter(midpoints, torch.zeros_like(midpoints)),
+            torch.nextafter(midpoints, torch.full_like(midpoints, float("inf"))),
+        )
+    )
+
+    def anchored(probes):
+        # A separate row per probe pins scale=1 even for block_size=16.
+        rows = torch.zeros(probes.numel(), block_size)
+        rows[:, 0], rows[:, -1] = probes, 6.0
+        return rows
+
+    boundary = torch.tensor([6.0 * 2.0**e for e in (-126, -125, -10, -1, 0, 1, 10)])
+    boundary = torch.cat(
+        (
+            boundary,
+            torch.nextafter(boundary, torch.zeros_like(boundary)),
+            torch.nextafter(boundary, torch.full_like(boundary, float("inf"))),
+        )
+    )
+    cases = {
+        "normal": torch.randn(5, 3, block_size * 3, generator=generator),
+        "wide_exponents": torch.randint(
+            0, 0x7F000000, (4096, block_size), generator=generator, dtype=torch.int32
+        ).view(torch.float32).clamp_max(torch.finfo(dtype).max),
+        "uniform": torch.rand(5, block_size * 2, generator=generator) * 24 - 12,
+        "grid_and_negative_grid": anchored(torch.cat((grid, -grid))),
+        "midpoints_and_neighbors": anchored(torch.cat((neighbors, -neighbors))),
+        "zero_blocks": torch.zeros(3, block_size * 2),
+        "signed_zero": anchored(torch.tensor([0.0, -0.0, -0.01, 0.01])),
+        "amax_power_boundaries": boundary[:, None].expand(-1, block_size).clone(),
+        "two_block_scales": torch.cat((anchored(midpoints), anchored(midpoints) * 16), -1),
+        "padded_width": torch.randn(3, block_size + 3, generator=generator),
+        "noncontiguous": torch.randn(3, block_size * 2, 2, generator=generator)[..., 0],
+    }
+    # fp16 cannot represent the extreme scale probes; keep all inputs finite.
+    if dtype == torch.float16:
+        cases["amax_power_boundaries"] = cases["amax_power_boundaries"].clamp(-65504, 65504)
+    return {name: values.to(dtype) for name, values in cases.items()}
+
+
+def _check_fp4_cpu_case(values, block_size):
+    before = values.clone()
+    expected = _fp4_grid_search_reference(values, block_size)
+    actual = _fp4_fake_quant(values, block_size)
+    assert torch.equal(actual, expected)
+    # torch.equal treats +0 and -0 as equal; compare bytes as well.
+    assert torch.equal(
+        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    )
+    assert actual.dtype == values.dtype and actual.shape == values.shape
+    assert torch.equal(values, before)
+    if values.shape[-1] == block_size * 2:
+        separate = torch.cat(
+            [_fp4_fake_quant(block, block_size) for block in values.split(block_size, -1)], -1
+        )
+        assert torch.equal(actual, separate)
+
+
+def _check_fp4_cpu_contract(dtype, block_size):
+    values = torch.linspace(-7, 7, block_size + 3, dtype=dtype).requires_grad_()
+    before = values.detach().clone()
+    gradient = torch.linspace(-3, 2, values.numel(), dtype=dtype)
+    _fp4_fake_quant(values, block_size).backward(gradient)
+    assert torch.equal(values.grad, gradient)
+    assert torch.equal(values.detach(), before)
+    disabled = _maybe_fp4_fake_quant(values, False, block_size)
+    assert disabled is values and disabled.data_ptr() == values.data_ptr()
+    assert torch.equal(
+        _maybe_fp4_fake_quant(values, True, block_size), _fp4_fake_quant(values, block_size)
+    )
+
+
+def _check_fp4_cpu_workspace(quantize=None):
+    """Reject any intermediate larger than the padded FP32 input."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    values = torch.randn(2, 64, dtype=torch.bfloat16)
+
+    class InputSizedWorkspace(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            for tensor in tree_leaves(result):
+                if isinstance(tensor, torch.Tensor):
+                    assert tensor.numel() <= values.numel(), (func, tensor.shape)
+            return result
+
+    with InputSizedWorkspace():
+        (quantize or _fp4_fake_quant)(values, 32)
+
+
+def _load_fp4_cpu_definitions():
+    """Execute the actual quantizer AST without importing GPU-only Megatron modules."""
+    import ast
+
+    source = Path(__file__).resolve().parents[4] / "megatron/core/transformer"
+    source = source / "experimental_attention_variant/csa2.py"
+    tree = ast.parse(source.read_text())
+    names = {"_FP4FakeQuantSTE", "_fp4_fake_quant", "_maybe_fp4_fake_quant"}
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
+    ]
+    assert {node.name for node in nodes} == names
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), globals())
+
+
+def _fp4_cpu_main():
+    import argparse
+    import json
+    import resource
+    import statistics
+    import subprocess
+    import sys
+    import time
+
+    parser = argparse.ArgumentParser(description="CPU-only FP4 equivalence and RSS benchmark")
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--backend", choices=("old", "new"), help=argparse.SUPPRESS)
+    parser.add_argument("--shape", type=int, nargs=3, default=(2048, 64, 128))
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--repeats", type=int, default=3)
+    args = parser.parse_args()
+    torch.set_num_threads(args.threads)
+    _load_fp4_cpu_definitions()
+    if args.backend:
+        quantize = _fp4_grid_search_reference if args.backend == "old" else _fp4_fake_quant
+        torch.manual_seed(429)
+        values = torch.randn(*args.shape, dtype=torch.bfloat16)
+        baseline_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        quantize(values[:1], 32)  # Warm the operators without retaining a full-size output.
+        times = []
+        for _ in range(args.repeats):
+            start = time.perf_counter()
+            result = quantize(values, 32)
+            times.append(time.perf_counter() - start)
+            del result
+        peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        print(
+            json.dumps(
+                {
+                    "backend": args.backend,
+                    "shape": args.shape,
+                    "dtype": "bfloat16",
+                    "threads": args.threads,
+                    "repeats": args.repeats,
+                    "seconds": times,
+                    "median_seconds": statistics.median(times),
+                    "baseline_mib": baseline_kib / 1024,
+                    "peak_rss_mib": peak_kib / 1024,
+                    "peak_increase_mib": (peak_kib - baseline_kib) / 1024,
+                }
+            )
+        )
+        return
+    passed = failed = 0
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        for block_size in (16, 32):
+            cases = _fp4_cpu_cases(block_size, dtype)
+            for name, values in cases.items():
+                label = f"{dtype} block={block_size} {name}"
+                try:
+                    _check_fp4_cpu_case(values, block_size)
+                except AssertionError:
+                    print(f"FAIL {label}")
+                    failed += 1
+                else:
+                    print(f"PASS {label}")
+                    passed += 1
+            try:
+                _check_fp4_cpu_contract(dtype, block_size)
+            except AssertionError:
+                print(f"FAIL {dtype} block={block_size} STE/disabled identity")
+                failed += 1
+            else:
+                print(f"PASS {dtype} block={block_size} STE/disabled identity")
+                passed += 1
+    try:
+        _check_fp4_cpu_workspace()
+    except AssertionError:
+        print("FAIL input-sized workspace")
+        failed += 1
+    else:
+        print("PASS input-sized workspace")
+        passed += 1
+    print(f"TOTAL {passed} PASS / {failed} FAIL")
+    if failed:
+        raise SystemExit(1)
+    if args.benchmark:
+        sys.stdout.flush()
+        for backend in ("old", "new"):
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--backend",
+                backend,
+                "--shape",
+                *map(str, args.shape),
+                "--threads",
+                str(args.threads),
+                "--repeats",
+                str(args.repeats),
+            ]
+            subprocess.run(command, check=True)
+        elements = math.prod(args.shape)
+        print(
+            f"Old distances alone: {elements * 8 * 4 / 1024**2:.1f} MiB; "
+            f"new FP32 input-shaped temporary: {elements * 4 / 1024**2:.1f} MiB"
+        )
+
+
+if __name__ == "__main__":
+    import torch
+    import torch.nn.functional as F
+
+    _fp4_cpu_main()
+    raise SystemExit(0)
+
 
 import pytest
 import torch
@@ -67,6 +319,20 @@ from megatron.core.transformer.module import convert_module_to_dtype_except_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import _make_config
+
+
+def test_fp4_fake_quant_cpu_workspace():
+    """A broadcast grid search would exceed this per-intermediate allocation bound."""
+    _check_fp4_cpu_workspace()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_fp4_fake_quant_cpu_grid_search_equivalence(dtype, block_size):
+    """Pin the vectorized quantizer against the original grid-search arithmetic."""
+    for values in _fp4_cpu_cases(block_size, dtype).values():
+        _check_fp4_cpu_case(values, block_size)
+    _check_fp4_cpu_contract(dtype, block_size)
 
 
 @pytest.mark.parametrize("block_size", [16, 32])
