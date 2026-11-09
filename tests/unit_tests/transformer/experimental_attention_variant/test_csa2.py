@@ -463,9 +463,25 @@ def test_fp4_fake_quant_has_straight_through_gradient():
     assert torch.equal(values.grad, torch.ones_like(values))
 
 
-def test_fp4_fake_quant_disabled_path_is_bitwise_baseline():
-    """Default-off config flags preserve the baseline tensor bit for bit."""
+def test_fp4_fake_quant_is_on_by_default():
+    """Both FP4 sites quantize without being asked: training mirrors inference."""
     config = _make_config()
+    assert config.csa2_fp4_compressed_kv is True
+    assert config.csa2_fp4_indexer_qk is True
+    values = torch.randn(3, 32, dtype=torch.bfloat16)
+    after_change = _maybe_fp4_fake_quant(values, config.csa2_fp4_compressed_kv, block_size=16)
+    assert not torch.equal(after_change, values)
+    torch.testing.assert_close(after_change, _fp4_fake_quant(values, block_size=16), rtol=0, atol=0)
+
+
+def test_fp4_fake_quant_explicit_off_is_bitwise_baseline():
+    """Turning the flags off reproduces the pre-default-flip behaviour exactly.
+
+    This is the parent-arm comparability contract: an arm that made its baseline on
+    full-precision compressed KV can still declare the switch off and get the same
+    tensors, bit for bit, with the same allocation.
+    """
+    config = _make_config(csa2_fp4_compressed_kv=False, csa2_fp4_indexer_qk=False)
     assert config.csa2_fp4_compressed_kv is False
     assert config.csa2_fp4_indexer_qk is False
     baseline = torch.randn(3, 32, dtype=torch.bfloat16)
@@ -510,9 +526,19 @@ def test_fp8_fake_quant_uses_floor_power_and_independent_32_wide_blocks():
     assert torch.equal(_fp8_fake_quant(heads), _fp8_reference(heads))
 
 
-def test_fp8_fake_quant_disabled_path_preserves_default_tensor_identity():
-    """The default-off feature is a literal no-op, including no allocation."""
+def test_fp8_fake_quant_is_on_by_default():
+    """The output-activation round trip runs without being asked."""
     config = _make_config()
+    assert config.csa2_fp8_output_act is True
+    values = torch.randn(3, 64, dtype=torch.bfloat16)
+    result = _maybe_fp8_fake_quant(values, config.csa2_fp8_output_act)
+    assert not torch.equal(result, values)
+    assert torch.equal(result, _fp8_fake_quant(values))
+
+
+def test_fp8_fake_quant_explicit_off_preserves_default_tensor_identity():
+    """An explicit False is a literal no-op, including no allocation."""
+    config = _make_config(csa2_fp8_output_act=False)
     assert config.csa2_fp8_output_act is False
     values = torch.randn(3, 64, dtype=torch.bfloat16)
     result = _maybe_fp8_fake_quant(values, config.csa2_fp8_output_act)
