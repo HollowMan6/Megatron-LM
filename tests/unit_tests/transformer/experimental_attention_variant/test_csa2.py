@@ -34,6 +34,8 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2Indexer,
     CSA2IndexerSubmodules,
     CSA2State,
+    _fp4_fake_quant,
+    _maybe_fp4_fake_quant,
     select_candidate_blocks,
 )
 from megatron.core.transformer.experimental_attention_variant.csa2_config import (
@@ -65,6 +67,58 @@ from megatron.core.transformer.module import convert_module_to_dtype_except_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import _make_config
+
+
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_fp4_fake_quant_matches_e2m1_grid_and_scale(block_size):
+    """FP4 blocks use power-of-two scales and round ties to even grid indices."""
+    values = torch.zeros(1, block_size * 2, dtype=torch.float32)
+    values[0, :8] = torch.tensor([0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 5.0, 6.0])
+    values[0, block_size] = 24.0
+    quantized = _fp4_fake_quant(values, block_size)
+    expected_grid = torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 6.0])
+    torch.testing.assert_close(quantized[0, :8], expected_grid)
+    assert torch.equal(quantized[0, block_size], torch.tensor(24.0))
+    assert torch.equal(quantized[0, 8], torch.tensor(0.0))
+
+
+def test_fp4_fake_quant_uses_independent_block_scales_and_power_boundaries():
+    """Each block chooses its own ceil-log2 scale, including amax power crossings."""
+    values = torch.tensor([[6.0, 10.0, 12.01, 11.0]])
+    quantized = _fp4_fake_quant(values, block_size=2)
+    torch.testing.assert_close(quantized, torch.tensor([[6.0, 8.0, 12.0, 12.0]]))
+
+
+def test_fp4_fake_quant_has_straight_through_gradient():
+    """Quantization changes forward values while preserving the input gradient."""
+    values = torch.tensor([[0.3, 1.2, 7.0]], requires_grad=True)
+    _fp4_fake_quant(values, block_size=2).sum().backward()
+    assert torch.equal(values.grad, torch.ones_like(values))
+
+
+def test_fp4_fake_quant_disabled_path_is_bitwise_baseline():
+    """Default-off config flags preserve the baseline tensor bit for bit."""
+    config = _make_config()
+    assert config.csa2_fp4_compressed_kv is False
+    assert config.csa2_fp4_indexer_qk is False
+    baseline = torch.randn(3, 32, dtype=torch.bfloat16)
+    after_change = _maybe_fp4_fake_quant(
+        baseline, config.csa2_fp4_compressed_kv, block_size=16
+    )
+    assert torch.equal(after_change, baseline)
+    assert after_change.data_ptr() == baseline.data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("compressed_kv", "indexer_qk"), [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_fp4_fake_quant_switches_are_independent(compressed_kv, indexer_qk):
+    """Both fake-quant sites can be enabled independently or together."""
+    config = _make_config(
+        csa2_fp4_compressed_kv=compressed_kv, csa2_fp4_indexer_qk=indexer_qk
+    )
+    assert config.csa2_fp4_compressed_kv is compressed_kv
+    assert config.csa2_fp4_indexer_qk is indexer_qk
 
 
 def test_global_fp8_is_accepted_by_csa2_validation():

@@ -107,6 +107,46 @@ _FUSED_DISABLE = os.environ.get("CSA2_FUSED_DISABLE", "0") == "1"
 _CAUSAL_LIMIT_CACHE: dict = {}
 _CAUSAL_LIMIT_CACHE_MAX = 64
 
+_FP4_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+class _FP4FakeQuantSTE(torch.autograd.Function):
+    """Return exactly quantized values and pass gradients through unchanged."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, block_size: int) -> torch.Tensor:
+        width = x.shape[-1]
+        pad = (-width) % block_size
+        values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
+        amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * 2.0**-126)
+        scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
+        normalized = (values / scale).clamp(-6.0, 6.0).abs()
+        grid = torch.tensor(_FP4_E2M1_GRID, device=x.device, dtype=torch.float32)
+        distances = (normalized.unsqueeze(-1) - grid).abs()
+        minimum = distances.amin(dim=-1, keepdim=True)
+        tied = distances == minimum
+        even_indices = torch.arange(8, device=x.device)
+        even = even_indices.remainder(2) == 0
+        even_tie = torch.where(tied & even, even_indices, 8).amin(dim=-1).clamp_max(7)
+        nearest = distances.argmin(dim=-1)
+        indices = torch.where(tied.sum(dim=-1).squeeze(-1) > 1, even_tie, nearest)
+        rounded = grid[indices] * values.sign() * scale
+        return rounded.reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+def _fp4_fake_quant(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Emulate the reference E2M1 quantizer with a straight-through gradient."""
+    return _FP4FakeQuantSTE.apply(x, block_size)
+
+
+def _maybe_fp4_fake_quant(x: torch.Tensor, enabled: bool, block_size: int) -> torch.Tensor:
+    """Leave disabled tensors untouched; otherwise apply blockwise E2M1 quantization."""
+    return _fp4_fake_quant(x, block_size) if enabled else x
+
 
 def _causal_key_limit(thd_layout, compressed_layout, keys: int) -> int:
     """Return the causal key limit for these layouts, computing it once per layout pair."""
@@ -982,9 +1022,10 @@ class CSA2Indexer(MegatronModule):
         # An incomplete first compression group produces no key rows.
         k = self.k_norm(k) if k.shape[0] else k * self.k_norm.weight
         if thd_layout is not None:
-            return _apply_thd_rope(k, rotary_pos_emb, self.config, thd_layout, self.cp_group)
+            k = _apply_thd_rope(k, rotary_pos_emb, self.config, thd_layout, self.cp_group)
+            return _maybe_fp4_fake_quant(k, self.config.csa2_fp4_indexer_qk, 32)
         pos_dim = self.config.qk_pos_emb_head_dim
-        return _apply_rope(
+        k = _apply_rope(
             k,
             nope_dim=self.head_dim - pos_dim,
             pos_dim=pos_dim,
@@ -994,6 +1035,7 @@ class CSA2Indexer(MegatronModule):
             ratio=self.compress_ratio,
             cp_group=self.cp_group,
         )
+        return _maybe_fp4_fake_quant(k, self.config.csa2_fp4_indexer_qk, 32)
 
     def _indexer_q_weights(
         self,
@@ -1019,6 +1061,7 @@ class CSA2Indexer(MegatronModule):
             if thd_layout is not None
             else _apply_rope(q, rotary_seq_len=q.shape[0], **rope_kwargs)
         )
+        q = _maybe_fp4_fake_quant(q, self.config.csa2_fp4_indexer_qk, 32)
         weights, _ = self.linear_weights_proj(x)
         weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
         return q, weights
@@ -1354,6 +1397,9 @@ class CompressedSparseAttention2(MegatronModule):
                     ratio=self.compress_ratio,
                     cp_group=self.cp_group,
                 )
+            )
+            state.global_kv = _maybe_fp4_fake_quant(
+                state.global_kv, self.config.csa2_fp4_compressed_kv, 16
             )
             if cp_layout is not None:
                 state.indexer_k = cp_layout.to_sequence_major(

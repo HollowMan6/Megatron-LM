@@ -434,6 +434,12 @@ class TransformerConfig(ModelParallelConfig):
     csa2_candidate_block_size: int = 0
     """Number of global positions in a candidate block."""
 
+    csa2_fp4_compressed_kv: bool = False
+    """Apply E2M1 fake quantization to post-RoPE compressed KV values."""
+
+    csa2_fp4_indexer_qk: bool = False
+    """Apply E2M1 fake quantization to post-RoPE indexer queries and keys."""
+
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
