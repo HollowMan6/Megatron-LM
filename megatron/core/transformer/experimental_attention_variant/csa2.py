@@ -138,6 +138,11 @@ class _FP4FakeQuantSTE(torch.autograd.Function):
 
 def _fp4_fake_quant(x: torch.Tensor, block_size: int) -> torch.Tensor:
     """Emulate the reference E2M1 quantizer with a straight-through gradient."""
+    if x.numel() == 0:
+        # A zero-element block tensor has no inferable block axis, and there is no
+        # value to quantize anyway: return the tensor itself so decode and an empty
+        # compression group get an identity instead of a reshape error.
+        return x
     return _FP4FakeQuantSTE.apply(x, block_size)
 
 
@@ -174,6 +179,8 @@ _CSA2_FP8_ACT_DEGRADED_REPORTED = False
 
 def _fp8_fake_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     """Emulate DeepSeek's blockwise UE8M0-scale E4M3 activation quantizer."""
+    if x.numel() == 0:
+        return x
     return _FP8FakeQuantSTE.apply(x, block_size)
 
 
@@ -202,8 +209,11 @@ def _csa2_fp8_act_quantize(
     if up_v_weight is not None:
         up_v_weight = up_v_weight.to(device=output.device, dtype=output.dtype).contiguous()
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
-    output = _fp8_fake_quant(output.to(torch.bfloat16), block_size)
-    return output.reshape(output.shape[0], output.shape[1], -1)
+    # The quantizer preserves the operand dtype and device (an fp32 path stays fp32)
+    # and returns zero-element input untouched, so this step can never change the
+    # dtype the rest of the attention path is built around. flatten() rather than
+    # reshape(..., -1): a zero-element tensor has no inferable trailing size.
+    return _fp8_fake_quant(output, block_size).flatten(2)
 
 
 def _csa2_fp8_act_output(
@@ -1101,7 +1111,9 @@ class CSA2Indexer(MegatronModule):
             raise ValueError("A CSA2 Reindex layer must consume its Full owner's indexer_k.")
         k, _ = self.linear_wk(latent)
         # An incomplete first compression group produces no key rows.
-        k = self.k_norm(k) if k.shape[0] else k * self.k_norm.weight
+        # Multiplying by the norm weight (fp32) in the empty-group branch promotes
+        # the key to fp32; cast back so the caller's dtype contract holds.
+        k = self.k_norm(k) if k.shape[0] else (k * self.k_norm.weight).to(k.dtype)
         if thd_layout is not None:
             k = _apply_thd_rope(k, rotary_pos_emb, self.config, thd_layout, self.cp_group)
             return _maybe_fp4_fake_quant(k, self.config.csa2_fp4_indexer_qk, 32)

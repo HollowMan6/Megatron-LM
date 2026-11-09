@@ -385,6 +385,7 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2Indexer,
     CSA2IndexerSubmodules,
     CSA2State,
+    _csa2_fp8_act_quantize,
     _fp8_fake_quant,
     _fp4_fake_quant,
     _maybe_fp8_fake_quant,
@@ -454,6 +455,49 @@ def test_fp4_fake_quant_uses_independent_block_scales_and_power_boundaries():
     values = torch.tensor([[6.0, 10.0, 12.01, 11.0]])
     quantized = _fp4_fake_quant(values, block_size=2)
     torch.testing.assert_close(quantized, torch.tensor([[6.0, 8.0, 12.0, 12.0]]))
+
+
+def test_fake_quantizers_pass_empty_inputs_through_untouched():
+    """Decode and an empty compression group produce zero-element activations.
+
+    A blockwise quantizer reshapes its last dimension into blocks, and a
+    zero-element tensor has no inferable block count, so the identity has to be
+    explicit: same object, same allocation, no exception.
+    """
+    for shape in ((0, 2, 64), (0,), (0, 2, 4, 16)):
+        empty = torch.empty(shape, dtype=torch.bfloat16)
+        assert _fp4_fake_quant(empty, 32) is empty
+        assert _fp8_fake_quant(empty, 32) is empty
+        assert _fp4_fake_quant(empty, 16).data_ptr() == empty.data_ptr()
+        assert _fp8_fake_quant(empty, 16).data_ptr() == empty.data_ptr()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fake_quantizers_preserve_the_operand_dtype(dtype):
+    """Neither quantizer may hand back a different dtype than it was given.
+
+    CSA2 keeps some tensors in fp32 for stability; a quantizer that forced bf16
+    would break the next op with "expected scalar type BFloat16 but found Float".
+    """
+    values = torch.randn(3, 64, dtype=dtype)
+    assert _fp4_fake_quant(values, 32).dtype is dtype
+    assert _fp8_fake_quant(values, 32).dtype is dtype
+    act = torch.randn(2, 3, 4, 64, dtype=dtype)
+    assert _csa2_fp8_act_quantize(act, None).dtype is dtype
+    assert _csa2_fp8_act_quantize(act, None).shape == (2, 3, 4 * 64)
+    latent = torch.randn(2, 3, 4, 16, dtype=dtype)
+    up_v_weight = torch.randn(4, 64, 16, dtype=dtype)
+    absorbed = _csa2_fp8_act_quantize(latent, up_v_weight)
+    assert absorbed.dtype is dtype
+    assert absorbed.shape == (2, 3, 4 * 64)
+
+
+def test_the_empty_group_key_norm_keeps_its_dtype():
+    """`k * k_norm.weight` in the empty branch must not promote to fp32."""
+    k = torch.empty(0, 4, dtype=torch.bfloat16)
+    weight = torch.ones(4, dtype=torch.float32)
+    assert (k * weight).dtype is torch.float32  # the promotion this guards against
+    assert (k * weight).to(k.dtype).dtype is torch.bfloat16
 
 
 def test_fp4_fake_quant_has_straight_through_gradient():
@@ -1402,7 +1446,20 @@ def _layers(pg_collection, dtype=torch.float32, candidates=True):
             csa2_candidate_block_size=0,
         )
     )
-    config = _make_config(params_dtype=dtype, dsa_indexer_topk=2, **overrides)
+    # The fake-quant sites are switched OFF for every module-level test in this file:
+    # they compare the module against the hand-written dense reference above, which
+    # does not quantize, so leaving the fork's new on-by-default flags in place would
+    # compare two different computations. The quantizers themselves are covered by
+    # test_csa2_fp8_output_act.py and by the FP4/FP8 cases below, which call them
+    # directly; nothing here depends on the default value either way.
+    config = _make_config(
+        params_dtype=dtype,
+        dsa_indexer_topk=2,
+        csa2_fp4_compressed_kv=False,
+        csa2_fp4_indexer_qk=False,
+        csa2_fp8_output_act=False,
+        **overrides,
+    )
     spec = _attention_spec(dtype)
     layers = torch.nn.ModuleList(
         build_module(spec, config=config, layer_number=i + 1, pg_collection=pg_collection)
