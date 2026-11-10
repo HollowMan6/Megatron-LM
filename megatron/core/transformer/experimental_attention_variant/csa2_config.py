@@ -114,15 +114,6 @@ def validate_csa2_config(config) -> None:
             raise NotImplementedError("CSA2 cross-layer state currently requires eager execution")
     if config.overlap_moe_expert_parallel_comm or config.delay_wgrad_compute:
         raise NotImplementedError("CSA2 does not yet support layer overlap or delayed wgrad")
-    # Fine-grained activation offloading is still refused, and now the reason is measured
-    # rather than assumed. The guard was lifted on 2026-11-12 (rev bf4870d01): CSA2's
-    # forward already calls the offload manager for core_attn/attn_proj and the experts
-    # module does the same for expert_fc1/moe_act, so allowing the flag looked
-    # numerics-neutral and safe. On the 190K lane it changed nothing -- a 175K run with
-    # offload_modules=[moe_act, expert_fc1] peaked at 127.96 GiB and stepped in 41.5 s,
-    # identical to the same run without offload -- so the hooks do not engage for this
-    # model's MoE path and the flag would advertise memory it does not free. Re-lifted
-    # only when a run can show a lower peak.
     if config.fine_grained_activation_offloading:
         # Not a wiring gap and not a configuration mistake: the offload manager keeps
         # every group's tensors resident on the GPU during warmup and only starts moving
