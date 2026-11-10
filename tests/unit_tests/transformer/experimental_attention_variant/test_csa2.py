@@ -3276,3 +3276,39 @@ def test_thd_cp_chunked_compression_matches_global_groups_and_gradients(chunk_in
     x.grad = None
     expected.sum().backward()
     torch.testing.assert_close(actual_grad, x.grad, atol=0, rtol=0)
+
+
+def test_activation_offload_is_allowed_for_the_supported_modules():
+    """CSA2 runs activation offload through the same manager the other variants use.
+
+    Measured 2026-11-12: the lane's 190K-token training step needs about 6 GiB it does
+    not have, and the MoE activation stash is ~19.3 GiB of the ~71 GiB of activations at
+    that length. Offloading moves already-computed tensors to host memory and back, so
+    the guard that refused it wholesale was refusing a numerics-neutral lever.
+    """
+    config = _make_config(
+        fine_grained_activation_offloading=True,
+        offload_modules=["moe_act", "expert_fc1", "core_attn", "attn_proj"],
+    )
+    validate_csa2_config(config)
+
+
+def test_activation_offload_of_qkv_linear_is_refused_by_name():
+    """The attention constructor cannot offload qkv_linear; refusing in config names it."""
+    config = _make_config(
+        fine_grained_activation_offloading=True, offload_modules=["moe_act", "qkv_linear"]
+    )
+    with pytest.raises(ValueError, match="qkv_linear"):
+        validate_csa2_config(config)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "match"),
+    [("overlap_moe_expert_parallel_comm", "layer overlap"), ("delay_wgrad_compute", "layer overlap")],
+)
+def test_layer_overlap_and_delayed_wgrad_stay_rejected(field_name, match):
+    """Only offload was lifted; the remaining two flags still have no CSA2 implementation."""
+    config = _make_config()
+    setattr(config, field_name, True)
+    with pytest.raises(NotImplementedError, match=match):
+        validate_csa2_config(config)

@@ -112,12 +112,20 @@ def validate_csa2_config(config) -> None:
                 )
         else:
             raise NotImplementedError("CSA2 cross-layer state currently requires eager execution")
-    if (
-        config.overlap_moe_expert_parallel_comm
-        or config.delay_wgrad_compute
-        or config.fine_grained_activation_offloading
-    ):
-        raise NotImplementedError("CSA2 does not yet support layer overlap or activation offload")
+    if config.overlap_moe_expert_parallel_comm or config.delay_wgrad_compute:
+        raise NotImplementedError("CSA2 does not yet support layer overlap or delayed wgrad")
+    # Fine-grained activation offloading IS supported: the hybrid attention forward
+    # already runs core_attn and attn_proj through the offload manager, and the MoE
+    # expert_fc1/moe_act groups go through the same interface. Offloading moves an
+    # already-computed tensor to host memory and back; it does not change any
+    # expression, so it stays numerics-neutral. The one module it cannot cover is
+    # qkv_linear -- the attention constructor refuses it outright, and reaching that
+    # assert from a config file would be a worse error than refusing here.
+    if config.fine_grained_activation_offloading and "qkv_linear" in (config.offload_modules or []):
+        raise ValueError(
+            "CSA2 hybrid attention cannot offload 'qkv_linear'; remove it from "
+            "offload_modules (core_attn, attn_proj, moe_act and expert_fc1 are supported)"
+        )
     ratios = config.csa_compress_ratios
     if not ratios or any(type(r) is not int or r not in (0, 1, 2) for r in ratios):
         raise ValueError("CSA2 requires one ratio (0, 1, or 2) per stack layer")
