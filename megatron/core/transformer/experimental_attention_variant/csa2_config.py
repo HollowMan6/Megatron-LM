@@ -124,12 +124,21 @@ def validate_csa2_config(config) -> None:
     # model's MoE path and the flag would advertise memory it does not free. Re-lifted
     # only when a run can show a lower peak.
     if config.fine_grained_activation_offloading:
+        # Not a wiring gap and not a configuration mistake: the offload manager keeps
+        # every group's tensors resident on the GPU during warmup and only starts moving
+        # bytes on the next iteration, so turning it on raises the peak to "all layers'
+        # groups at once" before it ever lowers it. Measured 2026-11-12 on this model:
+        # 131072 tokens alone peak at 109.74 GiB of a 139.81 GiB card, and enabling
+        # offload -- with the schedule lifecycle implemented (5fec05dc9) -- OOMed during
+        # the warmup of that very step. The feature needs ~30 GiB of headroom this model
+        # does not have at any length we run (nine probes; see the invariance report §6).
         raise NotImplementedError(
-            "CSA2 activation offloading is not wired yet: enabling it does not lower the "
-            "peak (measured 2026-11-12, 127.96 GiB with and without)"
+            "CSA2 activation offloading is structurally unusable on this model: its "
+            "warmup needs every layer's activation resident at once, which exceeds the "
+            "card before the offload saves anything (measured 2026-11-12)"
         )
     if config.offload_modules:
-        raise ValueError("CSA2 offload_modules has no effect yet; leave it empty")
+        raise ValueError("CSA2 offload_modules has no effect; leave it empty")
     ratios = config.csa_compress_ratios
     if not ratios or any(type(r) is not int or r not in (0, 1, 2) for r in ratios):
         raise ValueError("CSA2 requires one ratio (0, 1, or 2) per stack layer")
