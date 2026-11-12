@@ -80,3 +80,28 @@ def test_the_schedule_does_not_install_a_per_microbatch_chunk_handler(monkeypatc
 
     # The supported model passes the same check untouched.
     schedules._require_model_installs_offload_chunk(_config(), model)
+
+def test_the_guard_sees_through_a_wrapped_model(monkeypatch):
+    """The hook lives on the inner module; a DDP/Float16Module wrapper must not look unsupported."""
+    monkeypatch.setattr(schedules, "_offload_lifecycle_enabled", lambda config: True)
+
+    class _Inner:
+        def preprocess_for_fine_grained_offloading(self):
+            pass
+
+    class _Wrapper:
+        def __init__(self, module):
+            self.module = module
+
+    schedules._require_model_installs_offload_chunk(_config(), _Wrapper(_Inner()))
+    schedules._require_model_installs_offload_chunk(_config(), [_Wrapper(_Inner()), _Inner()])
+
+    class _NotAnOffloadModel:
+        pass
+
+    try:
+        schedules._require_model_installs_offload_chunk(_config(), _Wrapper(_NotAnOffloadModel()))
+    except RuntimeError as err:
+        assert "_NotAnOffloadModel" in str(err)
+    else:
+        raise AssertionError("a wrapped model without the hook must be refused")

@@ -477,7 +477,16 @@ def _require_model_installs_offload_chunk(config, model) -> None:
     if not _offload_lifecycle_enabled(config):
         return
     models = model if isinstance(model, (list, tuple)) else [model]
-    missing = [type(m).__name__ for m in models if not hasattr(m, "preprocess_for_fine_grained_offloading")]
+    missing = []
+    for chunk in models:
+        # `forward_step` is handed the wrapped model (DDP / Float16Module), and the hook lives on
+        # the inner module -- the same reason the surrounding code reaches attributes through
+        # `get_attr_wrapped_model` rather than `hasattr`.
+        inner = chunk
+        while not hasattr(inner, "preprocess_for_fine_grained_offloading") and hasattr(inner, "module"):
+            inner = inner.module
+        if not hasattr(inner, "preprocess_for_fine_grained_offloading"):
+            missing.append(type(inner).__name__)
     if missing:
         raise RuntimeError(
             "fine_grained_activation_offloading is enabled, but "
