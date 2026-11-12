@@ -483,7 +483,9 @@ def _require_model_installs_offload_chunk(config, model) -> None:
         # the inner module -- the same reason the surrounding code reaches attributes through
         # `get_attr_wrapped_model` rather than `hasattr`.
         inner = chunk
-        while not hasattr(inner, "preprocess_for_fine_grained_offloading") and hasattr(inner, "module"):
+        while not hasattr(inner, "preprocess_for_fine_grained_offloading") and hasattr(
+            inner, "module"
+        ):
             inner = inner.module
         if not hasattr(inner, "preprocess_for_fine_grained_offloading"):
             missing.append(type(inner).__name__)

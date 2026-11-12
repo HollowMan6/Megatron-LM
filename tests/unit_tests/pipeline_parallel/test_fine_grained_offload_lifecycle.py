@@ -27,19 +27,25 @@ def _config(**overrides):
 
 def test_lifecycle_is_off_unless_both_switch_and_modules_are_set():
     assert schedules._offload_lifecycle_enabled(_config()) is False
-    assert schedules._offload_lifecycle_enabled(
-        _config(fine_grained_activation_offloading=True)) is False
-    assert schedules._offload_lifecycle_enabled(
-        _config(offload_modules=["moe_act"])) is False
-    assert schedules._offload_lifecycle_enabled(
-        _config(fine_grained_activation_offloading=True, offload_modules=["moe_act"])) is True
+    assert (
+        schedules._offload_lifecycle_enabled(_config(fine_grained_activation_offloading=True))
+        is False
+    )
+    assert schedules._offload_lifecycle_enabled(_config(offload_modules=["moe_act"])) is False
+    assert (
+        schedules._offload_lifecycle_enabled(
+            _config(fine_grained_activation_offloading=True, offload_modules=["moe_act"])
+        )
+        is True
+    )
 
 
 def test_helper_does_nothing_without_the_switch(monkeypatch):
     """A run that did not ask for offloading must not import or touch the manager."""
     calls = []
     monkeypatch.setattr(
-        schedules, "_begin_offload_iteration", lambda config: calls.append(("iteration", None)))
+        schedules, "_begin_offload_iteration", lambda config: calls.append(("iteration", None))
+    )
     # The helper short-circuits before importing megatron's interface; calling it at all is
     # what the schedule does, and with the switch off it must return without raising even
     # though nothing is initialised.
@@ -54,9 +60,7 @@ def test_the_schedule_does_not_install_a_per_microbatch_chunk_handler(monkeypatc
     if an equivalent install were re-added under another name.
     """
     installed = []
-    monkeypatch.setattr(
-        schedules, "_offload_lifecycle_enabled", lambda config: True
-    )
+    monkeypatch.setattr(schedules, "_offload_lifecycle_enabled", lambda config: True)
 
     class _InstallingModel:
         def preprocess_for_fine_grained_offloading(self):
@@ -80,6 +84,7 @@ def test_the_schedule_does_not_install_a_per_microbatch_chunk_handler(monkeypatc
 
     # The supported model passes the same check untouched.
     schedules._require_model_installs_offload_chunk(_config(), model)
+
 
 def test_the_guard_sees_through_a_wrapped_model(monkeypatch):
     """The hook lives on the inner module; a DDP/Float16Module wrapper must not look unsupported."""
