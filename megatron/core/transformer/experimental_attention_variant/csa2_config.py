@@ -36,6 +36,9 @@ def _validate_tilelang_backend_dependencies() -> None:
 
 def validate_csa2_config(config) -> None:
     """Reject inconsistent owners, compression ratios and hierarchical candidate pools."""
+    for name in ("csa2_fp4_compressed_kv", "csa2_fp4_indexer_qk", "csa2_fp8_output_act"):
+        if type(getattr(config, name)) is not bool:
+            raise ValueError(f"{name} must be a boolean")
     if not config.multi_latent_attention or not config.qk_layernorm:
         raise ValueError("CSA2 requires MLA and learned query/KV RMS normalization")
     if config.normalization != "RMSNorm" or config.layernorm_zero_centered_gamma:
@@ -109,12 +112,24 @@ def validate_csa2_config(config) -> None:
                 )
         else:
             raise NotImplementedError("CSA2 cross-layer state currently requires eager execution")
-    if (
-        config.overlap_moe_expert_parallel_comm
-        or config.delay_wgrad_compute
-        or config.fine_grained_activation_offloading
-    ):
-        raise NotImplementedError("CSA2 does not yet support layer overlap or activation offload")
+    if config.overlap_moe_expert_parallel_comm or config.delay_wgrad_compute:
+        raise NotImplementedError("CSA2 does not yet support layer overlap or delayed wgrad")
+    if config.fine_grained_activation_offloading:
+        # Not a wiring gap and not a configuration mistake: the offload manager keeps
+        # every group's tensors resident on the GPU during warmup and only starts moving
+        # bytes on the next iteration, so turning it on raises the peak to "all layers'
+        # groups at once" before it ever lowers it. Measured 2026-11-12 on this model:
+        # 131072 tokens alone peak at 109.74 GiB of a 139.81 GiB card, and enabling
+        # offload -- with the schedule lifecycle implemented (5fec05dc9) -- OOMed during
+        # the warmup of that very step. The feature needs ~30 GiB of headroom this model
+        # does not have at any length we run (nine probes; see the invariance report §6).
+        raise NotImplementedError(
+            "CSA2 activation offloading is structurally unusable on this model: its "
+            "warmup needs every layer's activation resident at once, which exceeds the "
+            "card before the offload saves anything (measured 2026-11-12)"
+        )
+    if config.offload_modules:
+        raise ValueError("CSA2 offload_modules has no effect; leave it empty")
     ratios = config.csa_compress_ratios
     if not ratios or any(type(r) is not int or r not in (0, 1, 2) for r in ratios):
         raise ValueError("CSA2 requires one ratio (0, 1, or 2) per stack layer")

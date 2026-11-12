@@ -7,6 +7,7 @@ tensors belong to one stack forward and are passed explicitly; modules retain no
 state or inference caches.
 """
 
+import logging
 import os
 from copy import copy
 from dataclasses import dataclass
@@ -106,6 +107,136 @@ _FUSED_DISABLE = os.environ.get("CSA2_FUSED_DISABLE", "0") == "1"
 # identity of the two layout objects, holding strong references so the ids stay valid.
 _CAUSAL_LIMIT_CACHE: dict = {}
 _CAUSAL_LIMIT_CACHE_MAX = 64
+
+_FP4_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+class _FP4FakeQuantSTE(torch.autograd.Function):
+    """Return exactly quantized values and pass gradients through unchanged."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, block_size: int) -> torch.Tensor:
+        width = x.shape[-1]
+        pad = (-width) % block_size
+        values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
+        amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * 2.0**-126)
+        scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
+        normalized = (values / scale).clamp_(-6.0, 6.0).abs_()
+        # E2M1 has uniform spacing within [0, 2), [2, 4), and [4, 6].
+        # Each interval starts at an even grid index, so round-to-even on the
+        # local lattice also resolves midpoint ties to the even E2M1 index.
+        # Keep only input-shaped temporaries instead of eight distances per value.
+        step = torch.where(normalized < 2.0, 0.5, torch.where(normalized < 4.0, 1.0, 2.0))
+        normalized.div_(step).round_().mul_(step)
+        rounded = normalized.mul_(values.sign()).mul_(scale)
+        return rounded.reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+def _fp4_fake_quant(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Emulate the reference E2M1 quantizer with a straight-through gradient."""
+    if x.numel() == 0:
+        # A zero-element block tensor has no inferable block axis, and there is no
+        # value to quantize anyway: return the tensor itself so decode and an empty
+        # compression group get an identity instead of a reshape error.
+        return x
+    return _FP4FakeQuantSTE.apply(x, block_size)
+
+
+def _maybe_fp4_fake_quant(x: torch.Tensor, enabled: bool, block_size: int) -> torch.Tensor:
+    """Leave disabled tensors untouched; otherwise apply blockwise E2M1 quantization."""
+    return _fp4_fake_quant(x, block_size) if enabled else x
+
+
+class _FP8FakeQuantSTE(torch.autograd.Function):
+    """Return blockwise UE8M0/E4M3 values and pass gradients through unchanged."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+        width = x.shape[-1]
+        pad = (-width) % block_size
+        values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
+        amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+        scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+        normalized = (values / scale).clamp_(-448.0, 448.0)
+        rounded = normalized.to(torch.float8_e4m3fn).float().mul_(scale)
+        return rounded.reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+_LOGGER = logging.getLogger(__name__)
+
+#: Set once, the first time the FP8 output round trip runs without an absorbed
+#: V up projection, so the degraded branch is stated on every run and once.
+_CSA2_FP8_ACT_DEGRADED_REPORTED = False
+
+
+def _fp8_fake_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Emulate DeepSeek's blockwise UE8M0-scale E4M3 activation quantizer."""
+    if x.numel() == 0:
+        return x
+    return _FP8FakeQuantSTE.apply(x, block_size)
+
+
+def _maybe_fp8_fake_quant(x: torch.Tensor, enabled: bool, block_size: int = 32) -> torch.Tensor:
+    """Leave disabled tensors untouched; otherwise apply blockwise E4M3 quantization."""
+    return _fp8_fake_quant(x, block_size) if enabled else x
+
+
+def _csa2_fp8_act_quantize(
+    output: torch.Tensor, up_v_weight: torch.Tensor | None, block_size: int = 32
+) -> torch.Tensor:
+    """Apply the CSA2 FP8 output round trip, absorbed projection first when supplied.
+
+    ``up_v_weight`` exists for callers whose core attention returns compressed
+    latents: ``AbsorbedMLA`` hands it the ``[heads, v_head_dim, kv_lora_rank]``
+    weight, this call absorbs the V up projection and the blockwise E4M3 round
+    trip lands before the output projection, which is the official anchor.
+
+    The DSv4.1 hybrid attention path (``DSv4HybridAttention``) does not absorb: its
+    core attention already returns value-space ``[b, s, heads, v_head_dim]`` (the
+    module splits ``nope_dim = v_head_dim - pos_dim`` plus the rope part right
+    after), so no up projection is missing and none can be skipped -- the same
+    quantizer applies to that tensor as it stands, blocked along the same last
+    dimension. Both branches end flattened to ``[b, s, heads * last]``.
+    """
+    if up_v_weight is not None:
+        up_v_weight = up_v_weight.to(device=output.device, dtype=output.dtype).contiguous()
+        output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
+    # The quantizer preserves the operand dtype and device (an fp32 path stays fp32)
+    # and returns zero-element input untouched, so this step can never change the
+    # dtype the rest of the attention path is built around. flatten() rather than
+    # reshape(..., -1): a zero-element tensor has no inferable trailing size.
+    return _fp8_fake_quant(output, block_size).flatten(2)
+
+
+def _csa2_fp8_act_output(
+    output: torch.Tensor, up_v_weight: torch.Tensor | None, block_size: int = 32
+) -> torch.Tensor:
+    """The switched-on path: state a degraded branch once, then quantize either way.
+
+    A caller that cannot supply ``up_v_weight`` is reporting a fact about the
+    attention path, not a defect, so this reports it once per process and keeps
+    going instead of failing the run.
+    """
+    if up_v_weight is None:
+        global _CSA2_FP8_ACT_DEGRADED_REPORTED
+        if not _CSA2_FP8_ACT_DEGRADED_REPORTED:
+            _CSA2_FP8_ACT_DEGRADED_REPORTED = True
+            _LOGGER.info(
+                "csa2_fp8_output_act: no up_v_weight supplied, so the E4M3 round trip "
+                "applies to the attention output itself (block %d on its last dimension); "
+                "the absorbed V up projection is not part of this attention path and "
+                "nothing is skipped by omitting it.",
+                block_size,
+            )
+    return _csa2_fp8_act_quantize(output, up_v_weight, block_size)
 
 
 def _causal_key_limit(thd_layout, compressed_layout, keys: int) -> int:
@@ -980,11 +1111,14 @@ class CSA2Indexer(MegatronModule):
             raise ValueError("A CSA2 Reindex layer must consume its Full owner's indexer_k.")
         k, _ = self.linear_wk(latent)
         # An incomplete first compression group produces no key rows.
-        k = self.k_norm(k) if k.shape[0] else k * self.k_norm.weight
+        # Multiplying by the norm weight (fp32) in the empty-group branch promotes
+        # the key to fp32; cast back so the caller's dtype contract holds.
+        k = self.k_norm(k) if k.shape[0] else (k * self.k_norm.weight).to(k.dtype)
         if thd_layout is not None:
-            return _apply_thd_rope(k, rotary_pos_emb, self.config, thd_layout, self.cp_group)
+            k = _apply_thd_rope(k, rotary_pos_emb, self.config, thd_layout, self.cp_group)
+            return _maybe_fp4_fake_quant(k, self.config.csa2_fp4_indexer_qk, 32)
         pos_dim = self.config.qk_pos_emb_head_dim
-        return _apply_rope(
+        k = _apply_rope(
             k,
             nope_dim=self.head_dim - pos_dim,
             pos_dim=pos_dim,
@@ -994,6 +1128,7 @@ class CSA2Indexer(MegatronModule):
             ratio=self.compress_ratio,
             cp_group=self.cp_group,
         )
+        return _maybe_fp4_fake_quant(k, self.config.csa2_fp4_indexer_qk, 32)
 
     def _indexer_q_weights(
         self,
@@ -1019,6 +1154,7 @@ class CSA2Indexer(MegatronModule):
             if thd_layout is not None
             else _apply_rope(q, rotary_seq_len=q.shape[0], **rope_kwargs)
         )
+        q = _maybe_fp4_fake_quant(q, self.config.csa2_fp4_indexer_qk, 32)
         weights, _ = self.linear_weights_proj(x)
         weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
         return q, weights
@@ -1278,6 +1414,7 @@ class CompressedSparseAttention2(MegatronModule):
             and layer_idx > config.csa2_candidate_source_layer
         )
         self.compress_ratio = ratio
+        self.consumes_absorbed_v_up_projection = bool(config.csa2_fp8_output_act)
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
@@ -1354,6 +1491,9 @@ class CompressedSparseAttention2(MegatronModule):
                     ratio=self.compress_ratio,
                     cp_group=self.cp_group,
                 )
+            )
+            state.global_kv = _maybe_fp4_fake_quant(
+                state.global_kv, self.config.csa2_fp4_compressed_kv, 16
             )
             if cp_layout is not None:
                 state.indexer_k = cp_layout.to_sequence_major(
@@ -1682,6 +1822,7 @@ class CompressedSparseAttention2(MegatronModule):
         boundary_hidden: torch.Tensor | None = None,
         boundary_kv: torch.Tensor | None = None,
         csa2_state: CSA2State | None = None,
+        up_v_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend jointly to causal window and selected global latents using one softmax."""
         cp_size = get_pg_size(self.cp_group)
@@ -1844,6 +1985,8 @@ class CompressedSparseAttention2(MegatronModule):
         csa2_state.last_layer = self.layer_idx
         if thd_layout is not None:
             output = output.masked_fill(~thd_layout.valid_tokens[:, None, None], 0)
+        if self.config.csa2_fp8_output_act:
+            output = _csa2_fp8_act_output(output, up_v_weight)
         return output
 
     def forward(self, *args, **kwargs):

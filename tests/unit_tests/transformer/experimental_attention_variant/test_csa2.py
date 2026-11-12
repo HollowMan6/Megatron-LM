@@ -3,6 +3,9 @@
 """CSA2 dense-oracle and shared-gradient tests, adapted from NVIDIA/Megatron-LM#7224.
 Original implementation and oracles by Hongxiao Bai. The oracle follows DeepSeek's
 published inference implementation and does not call the CSA2 attention operators.
+
+Run this file directly with Python for CPU-only FP4 checks (no Megatron imports);
+add --benchmark for isolated old/new timing and peak RSS measurements.
 """
 
 import math
@@ -11,6 +14,354 @@ from contextlib import nullcontext
 from copy import copy
 from pathlib import Path
 from types import SimpleNamespace
+
+
+def _fp4_grid_search_reference(x, block_size):
+    """Frozen pre-vectorization implementation, including its FP32 distance arithmetic."""
+    width = x.shape[-1]
+    pad = (-width) % block_size
+    values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
+    amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * 2.0**-126)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
+    normalized = (values / scale).clamp(-6.0, 6.0).abs()
+    grid = torch.tensor((0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), dtype=torch.float32)
+    distances = (normalized.unsqueeze(-1) - grid).abs()
+    minimum = distances.amin(dim=-1, keepdim=True)
+    tied = distances == minimum
+    even_indices = torch.arange(8)
+    even = even_indices.remainder(2) == 0
+    even_tie = torch.where(tied & even, even_indices, 8).amin(dim=-1).clamp_max(7)
+    nearest = distances.argmin(dim=-1)
+    indices = torch.where(tied.sum(dim=-1).squeeze(-1) > 1, even_tie, nearest)
+    rounded = grid[indices] * values.sign() * scale
+    return rounded.reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
+
+
+def _fp4_cpu_cases(block_size, dtype):
+    generator = torch.Generator().manual_seed(429)
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    midpoints = (grid[:-1] + grid[1:]) / 2
+    neighbors = torch.cat(
+        (
+            midpoints,
+            torch.nextafter(midpoints, torch.zeros_like(midpoints)),
+            torch.nextafter(midpoints, torch.full_like(midpoints, float("inf"))),
+        )
+    )
+
+    def anchored(probes):
+        # A separate row per probe pins scale=1 even for block_size=16.
+        rows = torch.zeros(probes.numel(), block_size)
+        rows[:, 0], rows[:, -1] = probes, 6.0
+        return rows
+
+    boundary = torch.tensor([6.0 * 2.0**e for e in (-126, -125, -10, -1, 0, 1, 10)])
+    boundary = torch.cat(
+        (
+            boundary,
+            torch.nextafter(boundary, torch.zeros_like(boundary)),
+            torch.nextafter(boundary, torch.full_like(boundary, float("inf"))),
+        )
+    )
+    cases = {
+        "normal": torch.randn(5, 3, block_size * 3, generator=generator),
+        "wide_exponents": torch.randint(
+            0, 0x7F000000, (4096, block_size), generator=generator, dtype=torch.int32
+        ).view(torch.float32).clamp_max(torch.finfo(dtype).max),
+        "uniform": torch.rand(5, block_size * 2, generator=generator) * 24 - 12,
+        "grid_and_negative_grid": anchored(torch.cat((grid, -grid))),
+        "midpoints_and_neighbors": anchored(torch.cat((neighbors, -neighbors))),
+        "zero_blocks": torch.zeros(3, block_size * 2),
+        "signed_zero": anchored(torch.tensor([0.0, -0.0, -0.01, 0.01])),
+        "amax_power_boundaries": boundary[:, None].expand(-1, block_size).clone(),
+        "two_block_scales": torch.cat((anchored(midpoints), anchored(midpoints) * 16), -1),
+        "padded_width": torch.randn(3, block_size + 3, generator=generator),
+        "noncontiguous": torch.randn(3, block_size * 2, 2, generator=generator)[..., 0],
+    }
+    # fp16 cannot represent the extreme scale probes; keep all inputs finite.
+    if dtype == torch.float16:
+        cases["amax_power_boundaries"] = cases["amax_power_boundaries"].clamp(-65504, 65504)
+    return {name: values.to(dtype) for name, values in cases.items()}
+
+
+def _check_fp4_cpu_case(values, block_size):
+    before = values.clone()
+    expected = _fp4_grid_search_reference(values, block_size)
+    actual = _fp4_fake_quant(values, block_size)
+    assert torch.equal(actual, expected)
+    # torch.equal treats +0 and -0 as equal; compare bytes as well.
+    assert torch.equal(
+        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    )
+    assert actual.dtype == values.dtype and actual.shape == values.shape
+    assert torch.equal(values, before)
+    if values.shape[-1] == block_size * 2:
+        separate = torch.cat(
+            [_fp4_fake_quant(block, block_size) for block in values.split(block_size, -1)], -1
+        )
+        assert torch.equal(actual, separate)
+
+
+def _check_fp4_cpu_contract(dtype, block_size):
+    values = torch.linspace(-7, 7, block_size + 3, dtype=dtype).requires_grad_()
+    before = values.detach().clone()
+    gradient = torch.linspace(-3, 2, values.numel(), dtype=dtype)
+    _fp4_fake_quant(values, block_size).backward(gradient)
+    assert torch.equal(values.grad, gradient)
+    assert torch.equal(values.detach(), before)
+    disabled = _maybe_fp4_fake_quant(values, False, block_size)
+    assert disabled is values and disabled.data_ptr() == values.data_ptr()
+    assert torch.equal(
+        _maybe_fp4_fake_quant(values, True, block_size), _fp4_fake_quant(values, block_size)
+    )
+
+
+def _check_fp4_cpu_workspace(quantize=None):
+    """Reject any intermediate larger than the padded FP32 input."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    values = torch.randn(2, 64, dtype=torch.bfloat16)
+
+    class InputSizedWorkspace(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            for tensor in tree_leaves(result):
+                if isinstance(tensor, torch.Tensor):
+                    assert tensor.numel() <= values.numel(), (func, tensor.shape)
+            return result
+
+    with InputSizedWorkspace():
+        (quantize or _fp4_fake_quant)(values, 32)
+
+
+def _fp8_reference(x, block_size=32):
+    """Independent blockwise UE8M0/E4M3 reference for the DeepSeek activation path."""
+    width = x.shape[-1]
+    pad = (-width) % block_size
+    values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
+    amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    encoded = (values / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return (encoded.float() * scale).reshape(*x.shape[:-1], -1)[..., :width].to(x.dtype)
+
+
+def _check_fp8_cpu_case(values, block_size=32):
+    before = values.clone()
+    expected = _fp8_reference(values, block_size)
+    actual = _fp8_fake_quant(values, block_size)
+    assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
+    assert actual.shape == values.shape and actual.dtype == values.dtype
+    assert torch.equal(values, before)
+
+
+def _check_fp8_cpu_workspace(quantize=None):
+    """The quantizer must not create grid-expanded intermediates."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    values = torch.randn(2, 64, dtype=torch.bfloat16)
+
+    class InputSizedWorkspace(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            for tensor in tree_leaves(result):
+                if isinstance(tensor, torch.Tensor):
+                    assert tensor.numel() <= values.numel(), (func, tensor.shape)
+            return result
+
+    with InputSizedWorkspace():
+        (quantize or _fp8_fake_quant)(values, 32)
+
+
+def _load_fp8_cpu_definitions():
+    """Execute the actual FP8 quantizer AST without GPU-only Megatron imports."""
+    import ast
+
+    source = Path(__file__).resolve().parents[4] / "megatron/core/transformer"
+    source = source / "experimental_attention_variant/csa2.py"
+    tree = ast.parse(source.read_text())
+    names = {"_FP8FakeQuantSTE", "_fp8_fake_quant", "_maybe_fp8_fake_quant"}
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
+    ]
+    assert {node.name for node in nodes} == names
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), globals())
+
+
+def _load_fp4_cpu_definitions():
+    """Execute the actual quantizer AST without importing GPU-only Megatron modules."""
+    import ast
+
+    source = Path(__file__).resolve().parents[4] / "megatron/core/transformer"
+    source = source / "experimental_attention_variant/csa2.py"
+    tree = ast.parse(source.read_text())
+    names = {"_FP4FakeQuantSTE", "_fp4_fake_quant", "_maybe_fp4_fake_quant"}
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
+    ]
+    assert {node.name for node in nodes} == names
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), globals())
+
+
+def _fp4_cpu_main():
+    import argparse
+    import json
+    import resource
+    import statistics
+    import subprocess
+    import sys
+    import time
+
+    parser = argparse.ArgumentParser(description="CPU-only FP4 equivalence and RSS benchmark")
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--backend", choices=("old", "new"), help=argparse.SUPPRESS)
+    parser.add_argument("--shape", type=int, nargs=3, default=(2048, 64, 128))
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--repeats", type=int, default=3)
+    args = parser.parse_args()
+    torch.set_num_threads(args.threads)
+    _load_fp4_cpu_definitions()
+    if args.backend:
+        quantize = _fp4_grid_search_reference if args.backend == "old" else _fp4_fake_quant
+        torch.manual_seed(429)
+        values = torch.randn(*args.shape, dtype=torch.bfloat16)
+        baseline_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        quantize(values[:1], 32)  # Warm the operators without retaining a full-size output.
+        times = []
+        for _ in range(args.repeats):
+            start = time.perf_counter()
+            result = quantize(values, 32)
+            times.append(time.perf_counter() - start)
+            del result
+        peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        print(
+            json.dumps(
+                {
+                    "backend": args.backend,
+                    "shape": args.shape,
+                    "dtype": "bfloat16",
+                    "threads": args.threads,
+                    "repeats": args.repeats,
+                    "seconds": times,
+                    "median_seconds": statistics.median(times),
+                    "baseline_mib": baseline_kib / 1024,
+                    "peak_rss_mib": peak_kib / 1024,
+                    "peak_increase_mib": (peak_kib - baseline_kib) / 1024,
+                }
+            )
+        )
+        return
+    _load_fp8_cpu_definitions()
+    passed = failed = 0
+    for dtype in (torch.float32, torch.bfloat16):
+        generator = torch.Generator().manual_seed(541)
+        cases = [
+            torch.zeros(3, 64),
+            torch.tensor([[1e-6] + [0.0] * 63]),
+            torch.tensor([[448.0, -448.0] + [0.0] * 62]),
+            torch.tensor([[448.0] + [0.0] * 31 + [1.0] + [0.0] * 31]),
+            torch.tensor([[1.0, 0.0] + [0.0] * 62]),
+            torch.tensor([[448.01, -448.01] + [448.0] * 30 + [896.0, -896.0] + [0.0] * 30]),
+            torch.randn(3, 96, generator=generator) * 1000,
+            torch.randn(3, 64, 2, generator=generator)[..., 0],
+        ]
+        for case_idx, values in enumerate(cases):
+            try:
+                _check_fp8_cpu_case(values.to(dtype))
+            except AssertionError:
+                print(f"FAIL FP8 {dtype} case={case_idx}")
+                failed += 1
+            else:
+                print(f"PASS FP8 {dtype} case={case_idx}")
+                passed += 1
+        try:
+            values = torch.linspace(-500, 500, 64, dtype=dtype, requires_grad=True)
+            gradient = torch.linspace(-2, 3, 64, dtype=dtype)
+            _fp8_fake_quant(values).backward(gradient)
+            assert torch.equal(values.grad, gradient)
+            disabled = _maybe_fp8_fake_quant(values, False)
+            assert disabled is values and disabled.data_ptr() == values.data_ptr()
+        except AssertionError:
+            print(f"FAIL FP8 {dtype} STE/disabled identity")
+            failed += 1
+        else:
+            print(f"PASS FP8 {dtype} STE/disabled identity")
+            passed += 1
+    try:
+        _check_fp8_cpu_workspace()
+    except AssertionError:
+        print("FAIL FP8 input-sized workspace")
+        failed += 1
+    else:
+        print("PASS FP8 input-sized workspace")
+        passed += 1
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        for block_size in (16, 32):
+            cases = _fp4_cpu_cases(block_size, dtype)
+            for name, values in cases.items():
+                label = f"{dtype} block={block_size} {name}"
+                try:
+                    _check_fp4_cpu_case(values, block_size)
+                except AssertionError:
+                    print(f"FAIL {label}")
+                    failed += 1
+                else:
+                    print(f"PASS {label}")
+                    passed += 1
+            try:
+                _check_fp4_cpu_contract(dtype, block_size)
+            except AssertionError:
+                print(f"FAIL {dtype} block={block_size} STE/disabled identity")
+                failed += 1
+            else:
+                print(f"PASS {dtype} block={block_size} STE/disabled identity")
+                passed += 1
+    try:
+        _check_fp4_cpu_workspace()
+    except AssertionError:
+        print("FAIL input-sized workspace")
+        failed += 1
+    else:
+        print("PASS input-sized workspace")
+        passed += 1
+    print(f"TOTAL {passed} PASS / {failed} FAIL")
+    if failed:
+        raise SystemExit(1)
+    if args.benchmark:
+        sys.stdout.flush()
+        for backend in ("old", "new"):
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--backend",
+                backend,
+                "--shape",
+                *map(str, args.shape),
+                "--threads",
+                str(args.threads),
+                "--repeats",
+                str(args.repeats),
+            ]
+            subprocess.run(command, check=True)
+        elements = math.prod(args.shape)
+        print(
+            f"Old distances alone: {elements * 8 * 4 / 1024**2:.1f} MiB; "
+            f"new FP32 input-shaped temporary: {elements * 4 / 1024**2:.1f} MiB"
+        )
+
+
+if __name__ == "__main__":
+    import torch
+    import torch.nn.functional as F
+
+    _fp4_cpu_main()
+    raise SystemExit(0)
+
 
 import pytest
 import torch
@@ -34,6 +385,11 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2Indexer,
     CSA2IndexerSubmodules,
     CSA2State,
+    _csa2_fp8_act_quantize,
+    _fp8_fake_quant,
+    _fp4_fake_quant,
+    _maybe_fp8_fake_quant,
+    _maybe_fp4_fake_quant,
     select_candidate_blocks,
 )
 from megatron.core.transformer.experimental_attention_variant.csa2_config import (
@@ -65,6 +421,209 @@ from megatron.core.transformer.module import convert_module_to_dtype_except_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import _make_config
+
+
+def test_fp4_fake_quant_cpu_workspace():
+    """A broadcast grid search would exceed this per-intermediate allocation bound."""
+    _check_fp4_cpu_workspace()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_fp4_fake_quant_cpu_grid_search_equivalence(dtype, block_size):
+    """Pin the vectorized quantizer against the original grid-search arithmetic."""
+    for values in _fp4_cpu_cases(block_size, dtype).values():
+        _check_fp4_cpu_case(values, block_size)
+    _check_fp4_cpu_contract(dtype, block_size)
+
+
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_fp4_fake_quant_matches_e2m1_grid_and_scale(block_size):
+    """FP4 blocks use power-of-two scales and round ties to even grid indices."""
+    values = torch.zeros(1, block_size * 2, dtype=torch.float32)
+    values[0, :8] = torch.tensor([0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 5.0, 6.0])
+    values[0, block_size] = 24.0
+    quantized = _fp4_fake_quant(values, block_size)
+    expected_grid = torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 6.0])
+    torch.testing.assert_close(quantized[0, :8], expected_grid)
+    assert torch.equal(quantized[0, block_size], torch.tensor(24.0))
+    assert torch.equal(quantized[0, 8], torch.tensor(0.0))
+
+
+def test_fp4_fake_quant_uses_independent_block_scales_and_power_boundaries():
+    """Each block chooses its own ceil-log2 scale, including amax power crossings."""
+    values = torch.tensor([[6.0, 10.0, 12.01, 11.0]])
+    quantized = _fp4_fake_quant(values, block_size=2)
+    torch.testing.assert_close(quantized, torch.tensor([[6.0, 8.0, 12.0, 12.0]]))
+
+
+def test_fake_quantizers_pass_empty_inputs_through_untouched():
+    """Decode and an empty compression group produce zero-element activations.
+
+    A blockwise quantizer reshapes its last dimension into blocks, and a
+    zero-element tensor has no inferable block count, so the identity has to be
+    explicit: same object, same allocation, no exception.
+    """
+    for shape in ((0, 2, 64), (0,), (0, 2, 4, 16)):
+        empty = torch.empty(shape, dtype=torch.bfloat16)
+        assert _fp4_fake_quant(empty, 32) is empty
+        assert _fp8_fake_quant(empty, 32) is empty
+        assert _fp4_fake_quant(empty, 16).data_ptr() == empty.data_ptr()
+        assert _fp8_fake_quant(empty, 16).data_ptr() == empty.data_ptr()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fake_quantizers_preserve_the_operand_dtype(dtype):
+    """Neither quantizer may hand back a different dtype than it was given.
+
+    CSA2 keeps some tensors in fp32 for stability; a quantizer that forced bf16
+    would break the next op with "expected scalar type BFloat16 but found Float".
+    """
+    values = torch.randn(3, 64, dtype=dtype)
+    assert _fp4_fake_quant(values, 32).dtype is dtype
+    assert _fp8_fake_quant(values, 32).dtype is dtype
+    act = torch.randn(2, 3, 4, 64, dtype=dtype)
+    assert _csa2_fp8_act_quantize(act, None).dtype is dtype
+    assert _csa2_fp8_act_quantize(act, None).shape == (2, 3, 4 * 64)
+    latent = torch.randn(2, 3, 4, 16, dtype=dtype)
+    up_v_weight = torch.randn(4, 64, 16, dtype=dtype)
+    absorbed = _csa2_fp8_act_quantize(latent, up_v_weight)
+    assert absorbed.dtype is dtype
+    assert absorbed.shape == (2, 3, 4 * 64)
+
+
+def test_the_empty_group_key_norm_keeps_its_dtype():
+    """`k * k_norm.weight` in the empty branch must not promote to fp32."""
+    k = torch.empty(0, 4, dtype=torch.bfloat16)
+    weight = torch.ones(4, dtype=torch.float32)
+    assert (k * weight).dtype is torch.float32  # the promotion this guards against
+    assert (k * weight).to(k.dtype).dtype is torch.bfloat16
+
+
+def test_fp4_fake_quant_has_straight_through_gradient():
+    """Quantization changes forward values while preserving the input gradient."""
+    values = torch.tensor([[0.3, 1.2, 7.0]], requires_grad=True)
+    _fp4_fake_quant(values, block_size=2).sum().backward()
+    assert torch.equal(values.grad, torch.ones_like(values))
+
+
+def test_fp4_fake_quant_is_on_by_default():
+    """Both FP4 sites quantize without being asked: training mirrors inference."""
+    config = _make_config()
+    assert config.csa2_fp4_compressed_kv is True
+    assert config.csa2_fp4_indexer_qk is True
+    values = torch.randn(3, 32, dtype=torch.bfloat16)
+    after_change = _maybe_fp4_fake_quant(values, config.csa2_fp4_compressed_kv, block_size=16)
+    assert not torch.equal(after_change, values)
+    torch.testing.assert_close(after_change, _fp4_fake_quant(values, block_size=16), rtol=0, atol=0)
+
+
+def test_fp4_fake_quant_explicit_off_is_bitwise_baseline():
+    """Turning the flags off reproduces the pre-default-flip behaviour exactly.
+
+    This is the parent-arm comparability contract: an arm that made its baseline on
+    full-precision compressed KV can still declare the switch off and get the same
+    tensors, bit for bit, with the same allocation.
+    """
+    config = _make_config(csa2_fp4_compressed_kv=False, csa2_fp4_indexer_qk=False)
+    assert config.csa2_fp4_compressed_kv is False
+    assert config.csa2_fp4_indexer_qk is False
+    baseline = torch.randn(3, 32, dtype=torch.bfloat16)
+    after_change = _maybe_fp4_fake_quant(
+        baseline, config.csa2_fp4_compressed_kv, block_size=16
+    )
+    assert torch.equal(after_change, baseline)
+    assert after_change.data_ptr() == baseline.data_ptr()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fp8_fake_quant_matches_independent_reference(dtype):
+    """Power-of-two scales and E4M3 round-trip match an independent implementation."""
+    generator = torch.Generator().manual_seed(541)
+    cases = [
+        torch.zeros(3, 64),
+        torch.tensor([[448.0, -448.0] + [0.0] * 62]),
+        torch.tensor([[1.0, 0.0] + [0.0] * 62]),
+        torch.tensor([[448.01, -448.01] + [448.0] * 30 + [896.0, -896.0] + [0.0] * 30]),
+        torch.randn(3, 96, generator=generator) * 1000,
+        torch.randn(3, 64, 2, generator=generator)[..., 0],
+    ]
+    for values in cases:
+        _check_fp8_cpu_case(values.to(dtype))
+
+
+def test_fp8_fake_quant_uses_floor_power_and_independent_32_wide_blocks():
+    """A zero block uses the 1e-4 floor and adjacent blocks choose independent scales."""
+    values = torch.zeros(1, 64, dtype=torch.float32)
+    values[0, 32:] = 1.0
+    quantized = _fp8_fake_quant(values)
+    expected = _fp8_reference(values)
+    assert torch.equal(quantized, expected)
+    assert torch.equal(quantized[0, :32], torch.zeros(32))
+    assert torch.equal(quantized[0, 32:], torch.ones(32))
+    boundary = torch.zeros(1, 32)
+    boundary[0, 0] = torch.nextafter(torch.tensor(448.0), torch.tensor(float("inf")))
+    assert torch.equal(_fp8_fake_quant(boundary), _fp8_reference(boundary))
+    heads = torch.zeros(1, 1, 2, 16)
+    heads[0, 0, 0, 0] = 1.0
+    heads[0, 0, 1, 0] = 448.0
+    assert torch.equal(_fp8_fake_quant(heads), _fp8_reference(heads))
+
+
+def test_fp8_fake_quant_is_on_by_default():
+    """The output-activation round trip runs without being asked."""
+    config = _make_config()
+    assert config.csa2_fp8_output_act is True
+    values = torch.randn(3, 64, dtype=torch.bfloat16)
+    result = _maybe_fp8_fake_quant(values, config.csa2_fp8_output_act)
+    assert not torch.equal(result, values)
+    assert torch.equal(result, _fp8_fake_quant(values))
+
+
+def test_fp8_fake_quant_explicit_off_preserves_default_tensor_identity():
+    """An explicit False is a literal no-op, including no allocation."""
+    config = _make_config(csa2_fp8_output_act=False)
+    assert config.csa2_fp8_output_act is False
+    values = torch.randn(3, 64, dtype=torch.bfloat16)
+    result = _maybe_fp8_fake_quant(values, config.csa2_fp8_output_act)
+    assert result is values and result.data_ptr() == values.data_ptr()
+
+
+def test_fp8_fake_quant_switch_requires_boolean():
+    """CSA2 config validation rejects non-boolean activation quantization flags.
+
+    Construction runs validate_csa2_config() through MLATransformerConfig.__post_init__,
+    so the refusal happens inside ``_make_config`` and the assertion has to wrap the
+    constructor: a config carrying a non-boolean flag must not be obtainable at all,
+    which is exactly what production relies on.
+    """
+    with pytest.raises(ValueError, match="csa2_fp8_output_act must be a boolean"):
+        _make_config(csa2_fp8_output_act=1)
+
+
+def test_fp8_fake_quant_has_straight_through_gradient():
+    """The fake quantizer changes forward values and passes gradients unchanged."""
+    values = torch.linspace(-500, 500, 64, requires_grad=True)
+    gradient = torch.linspace(-2, 3, 64)
+    _fp8_fake_quant(values).backward(gradient)
+    assert torch.equal(values.grad, gradient)
+
+
+def test_fp8_fake_quant_cpu_workspace():
+    """The implementation keeps every temporary no larger than its input."""
+    _check_fp8_cpu_workspace()
+
+
+@pytest.mark.parametrize(
+    ("compressed_kv", "indexer_qk"), [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_fp4_fake_quant_switches_are_independent(compressed_kv, indexer_qk):
+    """Both fake-quant sites can be enabled independently or together."""
+    config = _make_config(
+        csa2_fp4_compressed_kv=compressed_kv, csa2_fp4_indexer_qk=indexer_qk
+    )
+    assert config.csa2_fp4_compressed_kv is compressed_kv
+    assert config.csa2_fp4_indexer_qk is indexer_qk
 
 
 def test_global_fp8_is_accepted_by_csa2_validation():
@@ -269,6 +828,25 @@ def pg_collection():
     Utils.destroy_model_parallel()
 
 
+def _unquantized(**overrides):
+    """Config for a module that is compared against the dense reference below.
+
+    The three fake-quant sites are ON by default on this fork, and the reference
+    implementations in this file (``_reference``, ``_reference_layer``,
+    ``_reference_scores``) do not quantize. Every module-level test therefore has
+    to state the sites off explicitly instead of inheriting the default -- these
+    tests measure the attention mechanism, not the quantizer, whose own behaviour
+    is pinned by ``test_csa2_fp8_output_act.py`` and by the FP4/FP8 cases in this
+    file that call ``_fp4_fake_quant`` / ``_fp8_fake_quant`` directly.
+    """
+    return _make_config(
+        csa2_fp4_compressed_kv=False,
+        csa2_fp4_indexer_qk=False,
+        csa2_fp8_output_act=False,
+        **overrides,
+    )
+
+
 def _layer(pg_collection, ratio, dtype=torch.float32, **overrides):
     config_values = dict(
         num_layers=1,
@@ -281,7 +859,7 @@ def _layer(pg_collection, ratio, dtype=torch.float32, **overrides):
         dsa_indexer_topk=2,
     )
     config_values.update(overrides)
-    config = _make_config(params_dtype=dtype, **config_values)
+    config = _unquantized(params_dtype=dtype, **config_values)
     layer = build_module(
         _attention_spec(dtype), config=config, layer_number=1, pg_collection=pg_collection
     ).cuda()
@@ -849,7 +1427,7 @@ def test_bf16_conversion_keeps_compressor_and_sink_in_fp32(pg_collection):
 
 @pytest.mark.parametrize("layer_number", [3, 5, 6])
 def test_cross_layer_modes_require_forward_state(pg_collection, layer_number):
-    config = _make_config()
+    config = _unquantized()
     layer = build_module(
         csa2_attention_spec, config=config, layer_number=layer_number, pg_collection=pg_collection
     ).cuda()
@@ -859,7 +1437,7 @@ def test_cross_layer_modes_require_forward_state(pg_collection, layer_number):
 
 
 def test_candidate_source_can_run_standalone(pg_collection):
-    config = _make_config()
+    config = _unquantized()
     layer = build_module(
         csa2_attention_spec, config=config, layer_number=4, pg_collection=pg_collection
     ).cuda()
@@ -892,7 +1470,7 @@ def _layers(pg_collection, dtype=torch.float32, candidates=True):
             csa2_candidate_block_size=0,
         )
     )
-    config = _make_config(params_dtype=dtype, dsa_indexer_topk=2, **overrides)
+    config = _unquantized(params_dtype=dtype, dsa_indexer_topk=2, **overrides)
     spec = _attention_spec(dtype)
     layers = torch.nn.ModuleList(
         build_module(spec, config=config, layer_number=i + 1, pg_collection=pg_collection)
@@ -2366,7 +2944,9 @@ class _CPURotaryTable(nn.Module):
 
 
 def _sharing_cores(per_token=False, reuse=False):
-    config = _make_config(
+    # Same rule as _layer/_layers: these cores are compared against each other and
+    # against the sharing reference, so the quantized path is not what they test.
+    config = _unquantized(
         num_layers=4 if reuse else 3,
         csa_compress_ratios=[1] * (4 if reuse else 3),
         csa2_kv_source_layers=[0],
@@ -2696,3 +3276,39 @@ def test_thd_cp_chunked_compression_matches_global_groups_and_gradients(chunk_in
     x.grad = None
     expected.sum().backward()
     torch.testing.assert_close(actual_grad, x.grad, atol=0, rtol=0)
+
+
+def test_activation_offload_is_allowed_for_the_supported_modules():
+    """CSA2 runs activation offload through the same manager the other variants use.
+
+    Measured 2026-11-12: the lane's 190K-token training step needs about 6 GiB it does
+    not have, and the MoE activation stash is ~19.3 GiB of the ~71 GiB of activations at
+    that length. Offloading moves already-computed tensors to host memory and back, so
+    the guard that refused it wholesale was refusing a numerics-neutral lever.
+    """
+    config = _make_config(
+        fine_grained_activation_offloading=True,
+        offload_modules=["moe_act", "expert_fc1", "core_attn", "attn_proj"],
+    )
+    validate_csa2_config(config)
+
+
+def test_activation_offload_of_qkv_linear_is_refused_by_name():
+    """The attention constructor cannot offload qkv_linear; refusing in config names it."""
+    config = _make_config(
+        fine_grained_activation_offloading=True, offload_modules=["moe_act", "qkv_linear"]
+    )
+    with pytest.raises(ValueError, match="qkv_linear"):
+        validate_csa2_config(config)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "match"),
+    [("overlap_moe_expert_parallel_comm", "layer overlap"), ("delay_wgrad_compute", "layer overlap")],
+)
+def test_layer_overlap_and_delayed_wgrad_stay_rejected(field_name, match):
+    """Only offload was lifted; the remaining two flags still have no CSA2 implementation."""
+    config = _make_config()
+    setattr(config, field_name, True)
+    with pytest.raises(NotImplementedError, match=match):
+        validate_csa2_config(config)

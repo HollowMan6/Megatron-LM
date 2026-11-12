@@ -431,6 +431,61 @@ def forward_step_calc_loss(
 
 
 @_otel_trace_fn('microbatch', 'megatron.microbatch.forward')
+def _offload_lifecycle_enabled(config) -> bool:
+    """Whether this run wants fine-grained activation offloading."""
+    return bool(
+        getattr(config, "fine_grained_activation_offloading", False)
+        and getattr(config, "offload_modules", None)
+    )
+
+
+def _begin_offload_microbatch(config, vp_stage=None) -> None:
+    """Give the offload managers a forward chunk for the microbatch about to run.
+
+    The offload managers are no-ops until a chunk exists: ``off_interface(...)`` inside
+    the model returns a context that moves nothing. Upstream Megatron installs one per
+    microbatch from its own training loop; this fork had no call site at all (measured
+    2026-11-12: ``init_chunk_handler`` appears only in tests), so enabling the flag
+    changed no peak and, once a caller installed a chunk by hand, hung instead -- the
+    warmup never ended. Installing it here covers every schedule variant at once.
+    """
+    if not _offload_lifecycle_enabled(config):
+        return
+    from megatron.core import parallel_state
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface as off_interface,
+    )
+
+    vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
+    off_interface.init_chunk_handler(
+        pp_rank=parallel_state.get_pipeline_model_parallel_rank(),
+        vp_size=vp_size,
+        vp_stage=vp_stage,
+        min_offloaded_tensor_size=getattr(config, "min_offloaded_tensor_size", 1024 * 1024),
+        delta_offload_bytes_across_pp_ranks=0,
+        activation_offload_fraction=getattr(config, "activation_offload_fraction", 1.0),
+        max_inflight_offloads=getattr(
+            config, "fine_grained_offloading_max_inflight_offloads", None
+        ),
+    )
+
+
+def _begin_offload_iteration(config) -> None:
+    """Open a new iteration for the offload manager.
+
+    ``reset`` is also what ends warmup: the manager caches group shapes during the first
+    iteration and only starts moving bytes on the next one, so a schedule that never
+    calls it keeps every group cached-and-idle forever.
+    """
+    if not _offload_lifecycle_enabled(config):
+        return
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface as off_interface,
+    )
+
+    off_interface.reset()
+
+
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -451,6 +506,9 @@ def forward_step(
 
     If it is the first stage, the input tensor is obtained from the data_iterator.
     Otherwise, the passed-in input_tensor is used.
+
+    The offload chunk for this microbatch is installed here rather than by each caller,
+    so that every schedule variant gets the same lifecycle.
 
     Args:
         forward_step_func (callable):
@@ -519,6 +577,7 @@ def forward_step(
         Tensor or list[Tensor]: The output object(s) from the forward step.
         Tensor: The number of tokens.
     """
+    _begin_offload_microbatch(config, vp_stage=vp_stage)
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     if config.timers is not None:
@@ -808,6 +867,7 @@ def forward_backward_no_pipelining(
     ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
     config = get_model_config(model)
+    _begin_offload_iteration(config)
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
