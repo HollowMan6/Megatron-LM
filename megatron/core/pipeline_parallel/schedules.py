@@ -462,6 +462,31 @@ def _begin_offload_iteration(config) -> None:
     off_interface.reset()
 
 
+def _require_model_installs_offload_chunk(config, model) -> None:
+    """Refuse to run fine-grained offloading for a model that never installs its chunk.
+
+    The per-microbatch chunk handler is installed by the model's own
+    ``preprocess_for_fine_grained_offloading`` (``GPTModel`` and ``HybridModel`` implement it).
+    ``init_model_chunk_offload_handler`` appends a ``ChunkOffloadHandler`` per call and flushes
+    on the last virtual stage, so a second schedule-side call installed two handlers and flushed
+    twice per microbatch -- which is why the schedule no longer installs one. A model without
+    the hook would instead offload nothing while the config still claims the feature is on
+    (``off_interface`` returns the tensor untouched when no chunk is current), so it fails here
+    rather than silently training without the memory saving.
+    """
+    if not _offload_lifecycle_enabled(config):
+        return
+    models = model if isinstance(model, (list, tuple)) else [model]
+    missing = [type(m).__name__ for m in models if not hasattr(m, "preprocess_for_fine_grained_offloading")]
+    if missing:
+        raise RuntimeError(
+            "fine_grained_activation_offloading is enabled, but "
+            f"{', '.join(sorted(set(missing)))} does not install a per-microbatch chunk handler "
+            "(no preprocess_for_fine_grained_offloading). Add the call to that model's forward, "
+            "or disable the feature."
+        )
+
+
 @_otel_trace_fn('microbatch', 'megatron.microbatch.forward')
 def forward_step(
     forward_step_func,
@@ -554,6 +579,8 @@ def forward_step(
         Tensor or list[Tensor]: The output object(s) from the forward step.
         Tensor: The number of tokens.
     """
+    _require_model_installs_offload_chunk(config, model)
+
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     if config.timers is not None:
