@@ -2336,6 +2336,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
 
+        # These fields are consumed by the native DSv4 attention path, not TE.
+        # Passing them through the generic adapter breaks ordinary THD GPT
+        # forwards because Transformer Engine does not accept these keywords.
+        self.kept_packed_seq_params.difference_update(
+            {"cp_partition_mode", "cp_chunk_index", "cp_chunk_count", "chunk_tape"}
+        )
+
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
 
