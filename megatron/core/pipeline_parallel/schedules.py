@@ -430,43 +430,19 @@ def forward_step_calc_loss(
     return output_tensor, num_tokens
 
 
-@_otel_trace_fn('microbatch', 'megatron.microbatch.forward')
 def _offload_lifecycle_enabled(config) -> bool:
-    """Whether this run wants fine-grained activation offloading."""
+    """Whether this run wants fine-grained activation offloading.
+
+    The per-microbatch chunk handler is installed by the model itself
+    (``GPTModel.forward`` / ``HybridModel.forward`` -> ``preprocess_for_fine_grained_offloading``),
+    which also knows the model chunk's own virtual-pipeline stage. The schedule therefore owns
+    only the iteration boundary (``_begin_offload_iteration``); installing the handler here as
+    well appended a second ``ChunkOffloadHandler`` per microbatch and flushed twice on the last
+    virtual stage.
+    """
     return bool(
         getattr(config, "fine_grained_activation_offloading", False)
         and getattr(config, "offload_modules", None)
-    )
-
-
-def _begin_offload_microbatch(config, vp_stage=None) -> None:
-    """Give the offload managers a forward chunk for the microbatch about to run.
-
-    The offload managers are no-ops until a chunk exists: ``off_interface(...)`` inside
-    the model returns a context that moves nothing. Upstream Megatron installs one per
-    microbatch from its own training loop; this fork had no call site at all (measured
-    2026-11-12: ``init_chunk_handler`` appears only in tests), so enabling the flag
-    changed no peak and, once a caller installed a chunk by hand, hung instead -- the
-    warmup never ended. Installing it here covers every schedule variant at once.
-    """
-    if not _offload_lifecycle_enabled(config):
-        return
-    from megatron.core import parallel_state
-    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-        FineGrainedActivationOffloadingInterface as off_interface,
-    )
-
-    vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
-    off_interface.init_chunk_handler(
-        pp_rank=parallel_state.get_pipeline_model_parallel_rank(),
-        vp_size=vp_size,
-        vp_stage=vp_stage,
-        min_offloaded_tensor_size=getattr(config, "min_offloaded_tensor_size", 1024 * 1024),
-        delta_offload_bytes_across_pp_ranks=0,
-        activation_offload_fraction=getattr(config, "activation_offload_fraction", 1.0),
-        max_inflight_offloads=getattr(
-            config, "fine_grained_offloading_max_inflight_offloads", None
-        ),
     )
 
 
@@ -486,6 +462,43 @@ def _begin_offload_iteration(config) -> None:
     off_interface.reset()
 
 
+def _require_model_installs_offload_chunk(config, model) -> None:
+    """Refuse to run fine-grained offloading for a model that never installs its chunk.
+
+    The per-microbatch chunk handler is installed by the model's own
+    ``preprocess_for_fine_grained_offloading`` (``GPTModel`` and ``HybridModel`` implement it).
+    ``init_model_chunk_offload_handler`` appends a ``ChunkOffloadHandler`` per call and flushes
+    on the last virtual stage, so a second schedule-side call installed two handlers and flushed
+    twice per microbatch -- which is why the schedule no longer installs one. A model without
+    the hook would instead offload nothing while the config still claims the feature is on
+    (``off_interface`` returns the tensor untouched when no chunk is current), so it fails here
+    rather than silently training without the memory saving.
+    """
+    if not _offload_lifecycle_enabled(config):
+        return
+    models = model if isinstance(model, (list, tuple)) else [model]
+    missing = []
+    for chunk in models:
+        # `forward_step` is handed the wrapped model (DDP / Float16Module), and the hook lives on
+        # the inner module -- the same reason the surrounding code reaches attributes through
+        # `get_attr_wrapped_model` rather than `hasattr`.
+        inner = chunk
+        while not hasattr(inner, "preprocess_for_fine_grained_offloading") and hasattr(
+            inner, "module"
+        ):
+            inner = inner.module
+        if not hasattr(inner, "preprocess_for_fine_grained_offloading"):
+            missing.append(type(inner).__name__)
+    if missing:
+        raise RuntimeError(
+            "fine_grained_activation_offloading is enabled, but "
+            f"{', '.join(sorted(set(missing)))} does not install a per-microbatch chunk handler "
+            "(no preprocess_for_fine_grained_offloading). Add the call to that model's forward, "
+            "or disable the feature."
+        )
+
+
+@_otel_trace_fn('microbatch', 'megatron.microbatch.forward')
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -577,7 +590,8 @@ def forward_step(
         Tensor or list[Tensor]: The output object(s) from the forward step.
         Tensor: The number of tokens.
     """
-    _begin_offload_microbatch(config, vp_stage=vp_stage)
+    _require_model_installs_offload_chunk(config, model)
+
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     if config.timers is not None:
