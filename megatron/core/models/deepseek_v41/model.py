@@ -43,6 +43,9 @@ class DeepSeekV41TrainingOutput:
 class DeepSeekV41Model(HybridModel):
     """Compose the V4.1 backbone, conditional memory, vision encoder and draft model."""
 
+    # External chunk drivers can require this before forwarding actual image inputs.
+    supports_cp_chunk_images = True
+
     def __init__(
         self,
         config,
@@ -252,6 +255,23 @@ class DeepSeekV41Model(HybridModel):
         hidden = self.embedding(input_ids, position_ids)
         image_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         if images is not None:
+            if (
+                packed_seq_params is not None
+                and (getattr(packed_seq_params, "cp_chunk_count", 1) or 1) > 1
+                and any(sample for sample in images)
+            ):
+                # Each intersecting chunk encodes the complete image again. Stochastic
+                # adapters would use a different mask for slices of the same image.
+                for tower in (self.vision, getattr(self, "aligner", None)):
+                    if tower is not None and any(
+                        isinstance(module, nn.Dropout) and module.training and 0 < module.p < 1
+                        for module in tower.modules()
+                    ):
+                        raise NotImplementedError(
+                            "Outer-sequence image chunking requires deterministic vision and "
+                            "aligner execution: disable stochastic vision/aligner dropout "
+                            "or use eval mode"
+                        )
             hidden = hidden.clone()
             if packed_seq_params is None:
                 if len(images) != input_ids.shape[0]:
@@ -268,16 +288,17 @@ class DeepSeekV41Model(HybridModel):
                         self._insert_image_tokens(hidden[image.start : end, b], image)
                         image_mask[b, image.start : end] = True
             else:
-                physical = (
-                    packed_seq_params.cu_seqlens_q_padded
-                    if packed_seq_params.cu_seqlens_q_padded is not None
-                    else packed_seq_params.cu_seqlens_q
-                ).tolist()
-                logical = packed_seq_params.cu_seqlens_q.diff().tolist()
+                cp_group = packed_seq_params.cp_group or self.pg_collection.cp
+                layout = build_csa2_thd_layout(
+                    packed_seq_params, hidden.shape[0], cp_group=cp_group
+                )
+                physical = layout.cu_seqlens_padded.tolist()
+                logical = layout.cu_seqlens.diff().tolist()
                 if input_ids.shape[0] != 1 or len(images) != len(logical):
                     raise ValueError("Packed image metadata must match THD sequence count")
-                cp_group = packed_seq_params.cp_group or self.pg_collection.cp
-                rank_start = cp_group.rank() * hidden.shape[0]
+                # The same virtual CP window addresses attention, Engram and images.
+                # Physical rank alone would inject pass 0's image slice on every pass.
+                rank_start = layout.global_start
                 rank_end = rank_start + hidden.shape[0]
                 for b, sample in enumerate(images):
                     for image in sample or ():
