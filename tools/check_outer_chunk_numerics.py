@@ -26,6 +26,8 @@ def load_modules():
     for name, relative in (
         ("megatron", "megatron"),
         ("megatron.core", "megatron/core"),
+        # The THD helper imports the layout without needing the eager scheduler.
+        ("megatron.core.pipeline_parallel", "megatron/core/pipeline_parallel"),
         (
             "outer_chunk_checks",
             "megatron/core/transformer/experimental_attention_variant/csa_utils",
