@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.outer_chunk_layout import get_outer_chunk_cp_coordinates
 
 
 def batch_of_row(cu_seqlens_q: Tensor, total_q: int | None = None) -> Tensor:
@@ -199,7 +200,12 @@ class CSA2THDLayout:
         to virtual rank g*cp_size + cp_rank, so the offset advances by one group per pass
         while `cp_size` (and therefore every gather shape) stays physical.
         """
-        virtual_rank = self.chunk_index * self.cp_size + self.cp_rank
+        virtual_rank, _ = get_outer_chunk_cp_coordinates(
+            cp_rank=self.cp_rank,
+            cp_size=self.cp_size,
+            chunk_index=self.chunk_index,
+            chunk_count=self.chunk_count,
+        )
         return virtual_rank * self.total_tokens
 
     @property
@@ -409,8 +415,6 @@ def _build_csa2_thd_layout(
     # group; only global_start / global_total follow the virtual geometry.
     _chunk_count = getattr(packed_seq_params, "cp_chunk_count", 1) or 1
     _chunk_index = getattr(packed_seq_params, "cp_chunk_index", 0) or 0
-    if _chunk_count > 1 and not 0 <= _chunk_index < _chunk_count:
-        raise ValueError("CSA2 THD chunk index outside the chunk count")
     if packed_seq_params.local_cp_size not in (None, cp_size):
         raise ValueError("CSA2 THD local_cp_size requires a matching explicit CP group")
     if cp_size < 1 or not 0 <= cp_rank < cp_size:
@@ -421,8 +425,10 @@ def _build_csa2_thd_layout(
     # rows, and the packing can pad past the tiling, so the capacity this check enforces must
     # span max(tiled, actual cumulative length). A plain `total_tokens * cp_size` rejected
     # every pass after the first by the padding remainder.
-    _chunk_count = getattr(packed_seq_params, "cp_chunk_count", 1) or 1
-    global_total = total_tokens * cp_size * _chunk_count
+    virtual_rank, virtual_size = get_outer_chunk_cp_coordinates(
+        cp_rank=cp_rank, cp_size=cp_size, chunk_index=_chunk_index, chunk_count=_chunk_count
+    )
+    global_total = total_tokens * virtual_size
     try:
         global_total = max(global_total, int(packed_seq_params.cu_seqlens_q[-1].item()))
     except Exception:
@@ -488,17 +494,9 @@ def _build_csa2_thd_layout(
     # microbatch's in-place replacement of static cumulative-length buffers.
     cu_q = cu_q.clone()
     physical_q = physical_q.clone()
-    # The pass offset is part of the row index, not just the CP offset: global_start puts pass
-    # `chunk_index` in its own slice of the virtual CP, so its rows start at
-    # chunk_index * cp_size * total_tokens. Leaving it out gave pass 1's queries the positions
-    # of pass 0 - RoPE then rotated them against the wrong prefix, which changes log_probs
-    # while leaving every KV shape correct (measured: K=2 loss stuck at 4.1632 through tape
-    # and coordinate fixes that all kept their shapes). chunk_index is 0 for K=1, so the term
-    # vanishes there and K=1 is unchanged.
     rows = (
         torch.arange(total_tokens, device=cu_q.device, dtype=torch.int64)
-        + cp_rank * total_tokens
-        + _chunk_index * cp_size * total_tokens
+        + virtual_rank * total_tokens
     )
     sequence_ids, positions, valid_tokens = get_thd_token_metadata(cu_q, physical_q, rows)
 
