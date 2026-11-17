@@ -404,6 +404,20 @@ class TransformerConfig(ModelParallelConfig):
     Enable only for deliberate QAT-style experiments or serving-numerics
     study; keep OFF for training-service parity."""
 
+    dsv4_fp8_output_act: bool = False
+    """Emulate E4M3/UE8M0 attention output quantization after inverse RoPE and before
+    the grouped ``wo_a`` projection, using 32-element blocks and an identity
+    straight-through gradient.
+
+    This enables only the DSv4 hybrid output site. ``kv_fp8_emulation`` also enables
+    this site, in addition to its KV sites. Setting both flags quantizes output once
+    with the identity gradient; leaving this flag off preserves the legacy cast backward.
+    For V4.1 output-only emulation, set ``csa2_fp8_output_act=False`` and
+    ``kv_fp8_emulation=False``. The CSA2 flag quantizes before inverse RoPE and can
+    include an absorbed V up projection on paths that supply one. Enabling both the
+    CSA2 and hybrid output flags composes their pre- and post-RoPE round trips.
+    """
+
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 

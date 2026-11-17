@@ -52,9 +52,9 @@ else:
 
 
 def _fp8_round_trip(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
-    """The DSv4 reference's act_quant(x, 32, 'ue8m0', e8m0fnu, inplace=True):
-    block-wise FP8 quantize-dequantize of the SERVING-side KV/o quantization (gated by kv_fp8_emulation, default OFF) (inference/kernel.py act_quant_kernel). Per 32-element block
-    along the last dim: absmax scale clamped to >=1e-4 and rounded UP to a
+    """The DSv4 reference's serving-side KV/output block-wise FP8 round trip.
+
+    Per 32-element block along the last dim: absmax scale clamped to >=1e-4 and rounded UP to a
     power of two (the e8m0 storage format), values quantized to e4m3 and
     dequantized back, internal computation in FP32."""
     shape = x.shape
@@ -474,12 +474,14 @@ class DSv4HybridAttention(Attention):
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
-        # DSv4 reference (inference/model.py, the wo_a einsum site):
-        # quantize/dequantize o before the einsum. OFF by default: serving-side
-        # behavior; the 2026-10-13 ablation showed it degrades training
-        # convergence (see TransformerConfig.kv_fp8_emulation).
-        if self.config.kv_fp8_emulation:
-            core_attn_out = _fp8_round_trip(core_attn_out)
+        # Both switches select this one post-inverse-RoPE serving output site.
+        # kv_fp8_emulation also controls the independent KV round trips below.
+        if self.config.kv_fp8_emulation or self.config.dsv4_fp8_output_act:
+            rounded = _fp8_round_trip(core_attn_out)
+            if self.config.dsv4_fp8_output_act:
+                # Keep the quantized values exact while passing unrounded gradients.
+                rounded = rounded.detach() + (core_attn_out - core_attn_out.detach())
+            core_attn_out = rounded
         linear_o_group_proj = self.linear_o_group_proj
         if isinstance(linear_o_group_proj, torch.nn.Module):
             # LoRA promotes this replicated parameter to a wrapped linear
