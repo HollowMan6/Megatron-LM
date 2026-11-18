@@ -2536,6 +2536,14 @@ def _add_network_size_args(parser):
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        "--no-csa2-fp8-output-act",
+        "--disable-csa2-fp8-output-act",
+        dest="csa2_fp8_output_act",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Disable CSA2 pre-RoPE FP8 output activation emulation.",
+    )
 
     group = parser.add_argument_group(title='network size')
 

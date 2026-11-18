@@ -39,6 +39,8 @@ def validate_csa2_config(config) -> None:
     for name in ("csa2_fp4_compressed_kv", "csa2_fp4_indexer_qk", "csa2_fp8_output_act"):
         if type(getattr(config, name)) is not bool:
             raise ValueError(f"{name} must be a boolean")
+    if config.csa2_fp4_compressed_kv_scale not in ("e4m3fn", "ue8m0"):
+        raise ValueError("csa2_fp4_compressed_kv_scale must be 'e4m3fn' or 'ue8m0'")
     if not config.multi_latent_attention or not config.qk_layernorm:
         raise ValueError("CSA2 requires MLA and learned query/KV RMS normalization")
     if config.normalization != "RMSNorm" or config.layernorm_zero_centered_gamma:

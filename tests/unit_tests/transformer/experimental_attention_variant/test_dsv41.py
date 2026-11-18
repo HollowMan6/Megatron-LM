@@ -132,3 +132,10 @@ def test_v41_cli_fields():
         args.csa2_candidate_topk_blocks,
         args.csa2_candidate_block_size,
     ) == (2, 2, 8)
+    assert args.csa2_fp4_compressed_kv_scale == "e4m3fn"
+    assert args.csa2_fp8_output_act is False
+    args = parser.parse_args(["--csa2-fp4-compressed-kv-scale", "ue8m0", "--csa2-fp8-output-act"])
+    assert args.csa2_fp4_compressed_kv_scale == "ue8m0"
+    assert args.csa2_fp8_output_act is True
+    for flag in ("--no-csa2-fp8-output-act", "--disable-csa2-fp8-output-act"):
+        assert parser.parse_args(["--csa2-fp8-output-act", flag]).csa2_fp8_output_act is False

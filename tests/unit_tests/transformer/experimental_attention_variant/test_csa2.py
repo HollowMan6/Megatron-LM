@@ -116,6 +116,18 @@ def _check_fp4_cpu_contract(dtype, block_size):
     )
 
 
+def _check_fp4_scale_formats(dtype):
+    values = torch.tensor([[0.0, 1.0, 7.0, -7.0]], dtype=dtype).requires_grad_()
+    e4m3 = _fp4_fake_quant(values, block_size=16, scale_format="e4m3fn")
+    expected = torch.tensor([[0.0, 1.125, 6.75, -6.75]], dtype=dtype)
+    assert torch.equal(e4m3, expected)
+    legacy = _fp4_fake_quant(values, block_size=16)
+    assert torch.equal(legacy, _fp4_grid_search_reference(values, 16))
+    upstream = torch.tensor([[0.25, 0.5, -1.0, 2.0]], dtype=dtype)
+    e4m3.backward(upstream)
+    assert torch.equal(values.grad, upstream)
+
+
 def _check_fp4_cpu_workspace(quantize=None):
     """Reject any intermediate larger than the padded FP32 input."""
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -301,6 +313,9 @@ def _fp4_cpu_main():
         print("PASS FP8 input-sized workspace")
         passed += 1
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        _check_fp4_scale_formats(dtype)
+        print(f"PASS {dtype} FP4 scale formats and E4M3FN STE")
+        passed += 1
         for block_size in (16, 32):
             cases = _fp4_cpu_cases(block_size, dtype)
             for name, values in cases.items():
@@ -512,10 +527,25 @@ def test_fp4_fake_quant_is_on_by_default():
     config = _make_config()
     assert config.csa2_fp4_compressed_kv is True
     assert config.csa2_fp4_indexer_qk is True
+    assert config.csa2_fp4_compressed_kv_scale == "e4m3fn"
     values = torch.randn(3, 32, dtype=torch.bfloat16)
-    after_change = _maybe_fp4_fake_quant(values, config.csa2_fp4_compressed_kv, block_size=16)
+    after_change = _maybe_fp4_fake_quant(
+        values, config.csa2_fp4_compressed_kv, 16, config.csa2_fp4_compressed_kv_scale
+    )
     assert not torch.equal(after_change, values)
-    torch.testing.assert_close(after_change, _fp4_fake_quant(values, block_size=16), rtol=0, atol=0)
+    assert torch.equal(after_change, _fp4_fake_quant(values, 16, "e4m3fn"))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fp4_fake_quant_scale_formats(dtype):
+    _check_fp4_scale_formats(dtype)
+
+
+def test_compressed_kv_scale_can_select_ue8m0():
+    config = _make_config(csa2_fp4_compressed_kv_scale="ue8m0")
+    assert config.csa2_fp4_compressed_kv_scale == "ue8m0"
+    with pytest.raises(ValueError, match="csa2_fp4_compressed_kv_scale"):
+        _make_config(csa2_fp4_compressed_kv_scale="invalid")
 
 
 def test_fp4_fake_quant_explicit_off_is_bitwise_baseline():
@@ -570,10 +600,15 @@ def test_fp8_fake_quant_uses_floor_power_and_independent_32_wide_blocks():
     assert torch.equal(_fp8_fake_quant(heads), _fp8_reference(heads))
 
 
-def test_fp8_fake_quant_is_on_by_default():
-    """The output-activation round trip runs without being asked."""
+def test_csa2_fp8_output_activation_is_off_by_default():
     config = _make_config()
-    assert config.csa2_fp8_output_act is True
+    assert config.csa2_fp8_output_act is False
+    values = torch.randn(3, 64, dtype=torch.bfloat16)
+    assert _maybe_fp8_fake_quant(values, config.csa2_fp8_output_act) is values
+
+
+def test_csa2_fp8_output_activation_can_be_enabled():
+    config = _make_config(csa2_fp8_output_act=True)
     values = torch.randn(3, 64, dtype=torch.bfloat16)
     result = _maybe_fp8_fake_quant(values, config.csa2_fp8_output_act)
     assert not torch.equal(result, values)

@@ -455,18 +455,17 @@ class TransformerConfig(ModelParallelConfig):
     run that leaves it in full precision computes something the sampler never does.
     """
 
+    csa2_fp4_compressed_kv_scale: Literal["e4m3fn", "ue8m0"] = "e4m3fn"
+    """Scale format for 16-element compressed KV blocks. Indexer Q/K uses UE8M0."""
+
     csa2_fp4_indexer_qk: bool = True
     """Apply E2M1 fake quantization to post-RoPE indexer queries and keys.
 
     On by default for the same reason as ``csa2_fp4_compressed_kv``.
     """
 
-    csa2_fp8_output_act: bool = True
-    """Apply UE8M0/E4M3 fake quantization to CSA2 output before linear_proj.
-
-    On by default: the official anchor quantizes the attention output before the
-    output projection, and training is supposed to compute what inference computes.
-    """
+    csa2_fp8_output_act: bool = False
+    """Apply UE8M0/E4M3 fake quantization to CSA2 output before inverse RoPE."""
 
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""

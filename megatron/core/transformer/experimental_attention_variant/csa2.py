@@ -115,12 +115,17 @@ class _FP4FakeQuantSTE(torch.autograd.Function):
     """Return exactly quantized values and pass gradients through unchanged."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, block_size: int) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, block_size: int, scale_format: str) -> torch.Tensor:
         width = x.shape[-1]
         pad = (-width) % block_size
         values = F.pad(x.float(), (0, pad)).reshape(*x.shape[:-1], -1, block_size)
-        amax = values.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * 2.0**-126)
-        scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
+        amax = values.abs().amax(dim=-1, keepdim=True)
+        if scale_format == "e4m3fn":
+            scale = (amax * (1.0 / 6.0)).clamp_(min=2.0**-9, max=448.0)
+            scale = scale.to(torch.float8_e4m3fn).float()
+        else:
+            amax = amax.clamp_min_(6.0 * 2.0**-126)
+            scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
         normalized = (values / scale).clamp_(-6.0, 6.0).abs_()
         # E2M1 has uniform spacing within [0, 2), [2, 4), and [4, 6].
         # Each interval starts at an even grid index, so round-to-even on the
@@ -133,22 +138,24 @@ class _FP4FakeQuantSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        return grad_output, None
+        return grad_output, None, None
 
 
-def _fp4_fake_quant(x: torch.Tensor, block_size: int) -> torch.Tensor:
+def _fp4_fake_quant(x: torch.Tensor, block_size: int, scale_format: str = "ue8m0") -> torch.Tensor:
     """Emulate the reference E2M1 quantizer with a straight-through gradient."""
     if x.numel() == 0:
         # A zero-element block tensor has no inferable block axis, and there is no
         # value to quantize anyway: return the tensor itself so decode and an empty
         # compression group get an identity instead of a reshape error.
         return x
-    return _FP4FakeQuantSTE.apply(x, block_size)
+    return _FP4FakeQuantSTE.apply(x, block_size, scale_format)
 
 
-def _maybe_fp4_fake_quant(x: torch.Tensor, enabled: bool, block_size: int) -> torch.Tensor:
+def _maybe_fp4_fake_quant(
+    x: torch.Tensor, enabled: bool, block_size: int, scale_format: str = "ue8m0"
+) -> torch.Tensor:
     """Leave disabled tensors untouched; otherwise apply blockwise E2M1 quantization."""
-    return _fp4_fake_quant(x, block_size) if enabled else x
+    return _fp4_fake_quant(x, block_size, scale_format) if enabled else x
 
 
 class _FP8FakeQuantSTE(torch.autograd.Function):
@@ -1493,7 +1500,10 @@ class CompressedSparseAttention2(MegatronModule):
                 )
             )
             state.global_kv = _maybe_fp4_fake_quant(
-                state.global_kv, self.config.csa2_fp4_compressed_kv, 16
+                state.global_kv,
+                self.config.csa2_fp4_compressed_kv,
+                16,
+                self.config.csa2_fp4_compressed_kv_scale,
             )
             if cp_layout is not None:
                 state.indexer_k = cp_layout.to_sequence_major(

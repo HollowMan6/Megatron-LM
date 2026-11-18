@@ -35,7 +35,7 @@ def attention_code():
     return namespace
 
 
-def test_output_act_defaults_preserve_the_existing_quantization_switches():
+def test_output_activation_quantization_defaults_to_disabled():
     tree = ast.parse((SOURCE / "transformer_config.py").read_text())
     defaults = {
         node.target.id: ast.literal_eval(node.value)
@@ -47,7 +47,7 @@ def test_output_act_defaults_preserve_the_existing_quantization_switches():
     assert defaults == {
         "dsv4_fp8_output_act": False,
         "kv_fp8_emulation": False,
-        "csa2_fp8_output_act": True,
+        "csa2_fp8_output_act": False,
     }
 
 
